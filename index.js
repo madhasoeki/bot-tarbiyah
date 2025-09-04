@@ -1,14 +1,19 @@
 const express = require('express');
 const TelegramBot = require('node-telegram-bot-api');
-const { PrismaClient } = require('@prisma/client');
+const fs = require('fs').promises;
+const path = require('path');
 const cron = require('node-cron');
 const moment = require('moment-timezone');
 require('dotenv').config();
 
 // Initialize
 const app = express();
-const prisma = new PrismaClient();
 const bot = new TelegramBot(process.env.BOT_TOKEN);
+
+// Data file paths
+const DATA_DIR = './data';
+const USERS_FILE = path.join(DATA_DIR, 'users.json');
+const TARBIYAH_FILE = path.join(DATA_DIR, 'tarbiyah.json');
 
 // Middleware
 app.use(express.json());
@@ -43,82 +48,122 @@ const TARBIYAH_POINTS = [
   { key: 'buzzer', label: 'Buzzer', reportLabel: 'Buzzer PD' }
 ];
 
-// Database Helper Functions
+// File system helpers
+async function ensureDataDir() {
+  try {
+    await fs.mkdir(DATA_DIR, { recursive: true });
+  } catch (error) {
+    console.error('Error creating data directory:', error);
+  }
+}
+
+async function readJsonFile(filePath, defaultValue = {}) {
+  try {
+    const data = await fs.readFile(filePath, 'utf8');
+    return JSON.parse(data);
+  } catch (error) {
+    if (error.code === 'ENOENT') {
+      // File doesn't exist, return default value
+      await writeJsonFile(filePath, defaultValue);
+      return defaultValue;
+    }
+    console.error(`Error reading ${filePath}:`, error);
+    return defaultValue;
+  }
+}
+
+async function writeJsonFile(filePath, data) {
+  try {
+    await fs.writeFile(filePath, JSON.stringify(data, null, 2), 'utf8');
+  } catch (error) {
+    console.error(`Error writing ${filePath}:`, error);
+  }
+}
+
+// Data access functions
 async function findOrCreateUser(telegramUser) {
   try {
-    let user = await prisma.user.findUnique({
-      where: { telegramId: telegramUser.id }
-    });
+    const users = await readJsonFile(USERS_FILE, {});
+    const userId = telegramUser.id.toString();
 
-    if (!user) {
-      user = await prisma.user.create({
-        data: {
-          telegramId: telegramUser.id,
-          firstName: telegramUser.first_name,
-          lastName: telegramUser.last_name,
-          username: telegramUser.username
-        }
-      });
+    if (!users[userId]) {
+      users[userId] = {
+        telegramId: telegramUser.id,
+        firstName: telegramUser.first_name,
+        lastName: telegramUser.last_name,
+        username: telegramUser.username,
+        displayName: null,
+        createdAt: new Date().toISOString()
+      };
+      await writeJsonFile(USERS_FILE, users);
     }
 
-    return user;
+    return users[userId];
   } catch (error) {
-    console.error('Database error:', error);
+    console.error('Error in findOrCreateUser:', error);
     return null;
   }
 }
 
-async function getTodayTarbiyah(userId) {
-  const today = moment().tz('Asia/Jakarta').format('YYYY-MM-DD');
-  
+async function updateUserName(telegramId, displayName) {
   try {
-    const record = await prisma.tarbiyahRecord.findUnique({
-      where: {
-        userId_date: {
-          userId: userId,
-          date: new Date(today)
-        }
-      }
-    });
-
-    return record;
+    const users = await readJsonFile(USERS_FILE, {});
+    const userId = telegramId.toString();
+    
+    if (users[userId]) {
+      users[userId].displayName = displayName;
+      await writeJsonFile(USERS_FILE, users);
+      return true;
+    }
+    return false;
   } catch (error) {
-    console.error('Database error:', error);
+    console.error('Error updating user name:', error);
+    return false;
+  }
+}
+
+async function getTodayTarbiyah(telegramId) {
+  try {
+    const today = moment().tz('Asia/Jakarta').format('YYYY-MM-DD');
+    const tarbiyahData = await readJsonFile(TARBIYAH_FILE, {});
+    const userId = telegramId.toString();
+    
+    return tarbiyahData[userId] && tarbiyahData[userId][today] 
+      ? tarbiyahData[userId][today] 
+      : null;
+  } catch (error) {
+    console.error('Error getting today tarbiyah:', error);
     return null;
   }
 }
 
-async function updateTarbiyahPoint(userId, pointKey, value) {
-  const today = moment().tz('Asia/Jakarta').format('YYYY-MM-DD');
-  
+async function updateTarbiyahPoint(telegramId, pointKey, value) {
   try {
-    const record = await prisma.tarbiyahRecord.upsert({
-      where: {
-        userId_date: {
-          userId: userId,
-          date: new Date(today)
-        }
-      },
-      create: {
-        userId: userId,
-        date: new Date(today),
-        [pointKey]: value
-      },
-      update: {
-        [pointKey]: value
-      }
-    });
-
-    return record;
+    const today = moment().tz('Asia/Jakarta').format('YYYY-MM-DD');
+    const tarbiyahData = await readJsonFile(TARBIYAH_FILE, {});
+    const userId = telegramId.toString();
+    
+    if (!tarbiyahData[userId]) {
+      tarbiyahData[userId] = {};
+    }
+    
+    if (!tarbiyahData[userId][today]) {
+      tarbiyahData[userId][today] = {};
+    }
+    
+    tarbiyahData[userId][today][pointKey] = value;
+    tarbiyahData[userId][today].updatedAt = new Date().toISOString();
+    
+    await writeJsonFile(TARBIYAH_FILE, tarbiyahData);
+    return true;
   } catch (error) {
-    console.error('Database error:', error);
-    return null;
+    console.error('Error updating tarbiyah point:', error);
+    return false;
   }
 }
 
 // Bot Command Handlers
 bot.onText(/\/start/, async (msg) => {
-  // Only respond to private chats
   if (msg.chat.type !== 'private') return;
 
   const user = await findOrCreateUser(msg.from);
@@ -164,13 +209,13 @@ bot.onText(/\/catat/, async (msg) => {
   }
 
   const today = moment().tz('Asia/Jakarta').format('DD/MM/YYYY');
-  const todayRecord = await getTodayTarbiyah(user.id);
+  const todayRecord = await getTodayTarbiyah(msg.from.id);
 
   // Send header
   const headerMessage = `📋 <b>Catat Tarbiyah - ${today}</b>\n👤 <b>Nama:</b> ${user.displayName}\n\nSilakan klik untuk setiap aktivitas tarbiyah:`;
   bot.sendMessage(msg.chat.id, headerMessage, { parse_mode: 'HTML' });
 
-  // Send each tarbiyah point as separate message with inline keyboard
+  // Send each tarbiyah point as separate message
   for (let i = 0; i < TARBIYAH_POINTS.length; i++) {
     const point = TARBIYAH_POINTS[i];
     const currentValue = todayRecord ? todayRecord[point.key] : false;
@@ -185,7 +230,7 @@ bot.onText(/\/catat/, async (msg) => {
 
     const message = `${i + 1}. <b>${point.label}</b>\nStatus: ${status}`;
     
-    bot.sendMessage(msg.chat.id, message, {
+    await bot.sendMessage(msg.chat.id, message, {
       parse_mode: 'HTML',
       reply_markup: keyboard
     });
@@ -204,7 +249,7 @@ bot.onText(/\/status/, async (msg) => {
   }
 
   const today = moment().tz('Asia/Jakarta').format('DD/MM/YYYY');
-  const todayRecord = await getTodayTarbiyah(user.id);
+  const todayRecord = await getTodayTarbiyah(msg.from.id);
 
   let message = `📊 <b>Status Tarbiyah - ${today}</b>\n👤 <b>Nama:</b> ${user.displayName}\n\n`;
 
@@ -238,55 +283,41 @@ bot.onText(/^nama:\s*(.+)$/i, async (msg, match) => {
     );
   }
 
-  const user = await findOrCreateUser(msg.from);
-  if (!user) {
-    return bot.sendMessage(msg.chat.id, '❌ Terjadi error. Silakan coba lagi.');
-  }
-
-  try {
-    await prisma.user.update({
-      where: { id: user.id },
-      data: { displayName: name }
-    });
-
+  const success = await updateUserName(msg.from.id, name);
+  
+  if (success) {
     const responseText = `✅ Nama berhasil disimpan: <b>${name}</b>\n\n` +
                         `Sekarang Anda bisa menggunakan:\n` +
                         `• /catat - untuk mencatat tarbiyah\n` +
                         `• /status - untuk melihat status tarbiyah`;
 
     bot.sendMessage(msg.chat.id, responseText, { parse_mode: 'HTML' });
-  } catch (error) {
+  } else {
     bot.sendMessage(msg.chat.id, '❌ Gagal menyimpan nama. Silakan coba lagi.');
   }
 });
 
-// Handle callback queries (button clicks)
+// Handle callback queries
 bot.on('callback_query', async (query) => {
   const data = query.data;
-  const user = await findOrCreateUser(query.from);
-
-  if (!user) {
-    return bot.answerCallbackQuery(query.id, { text: 'Error occurred' });
-  }
 
   if (data.startsWith('tarbiyah_')) {
     const parts = data.split('_');
     if (parts.length >= 3) {
-      const action = parts[parts.length - 1]; // 'done' or 'undone'
-      const pointKey = parts.slice(1, -1).join('_'); // get pointKey
+      const action = parts[parts.length - 1];
+      const pointKey = parts.slice(1, -1).join('_');
       
       const value = action === 'done';
       const point = TARBIYAH_POINTS.find(p => p.key === pointKey);
       
       if (point) {
-        const success = await updateTarbiyahPoint(user.id, pointKey, value);
+        const success = await updateTarbiyahPoint(query.from.id, pointKey, value);
         
         if (success) {
           const index = TARBIYAH_POINTS.findIndex(p => p.key === pointKey);
           const status = value ? '✅ Sudah' : '❌ Belum';
           const message = `${index + 1}. <b>${point.label}</b>\nStatus: ${status}\n\n✅ <i>Tersimpan! Gunakan /catat untuk mengedit.</i>`;
           
-          // Edit message to remove keyboard
           bot.editMessageText(message, {
             chat_id: query.message.chat.id,
             message_id: query.message.message_id,
@@ -302,14 +333,6 @@ bot.on('callback_query', async (query) => {
   }
 });
 
-// Admin command: daily report
-bot.onText(/\/dailyreport/, async (msg) => {
-  if (msg.from.id !== ADMIN_USER_ID) return;
-  
-  await sendDailyReport();
-  bot.sendMessage(msg.chat.id, '📊 Daily report berhasil dikirim ke grup.');
-});
-
 // Daily Report Function
 async function sendDailyReport() {
   try {
@@ -317,78 +340,72 @@ async function sendDailyReport() {
     const todayStr = today.format('YYYY-MM-DD');
     const formattedDate = today.format('dddd, D MMMM YYYY');
     
-    // Get all today's records with user info
-    const records = await prisma.tarbiyahRecord.findMany({
-      where: {
-        date: new Date(todayStr)
-      },
-      include: {
-        user: true
-      }
-    });
+    const users = await readJsonFile(USERS_FILE, {});
+    const tarbiyahData = await readJsonFile(TARBIYAH_FILE, {});
+    
+    let allReports = `📊 <b>LAPORAN HARIAN TARBIYAH</b>\n${formattedDate}\n\n`;
+    let reportCount = 0;
 
-    if (records.length === 0) {
-      console.log('No tarbiyah data found for daily report');
-      return;
+    for (const [userId, user] of Object.entries(users)) {
+      if (tarbiyahData[userId] && tarbiyahData[userId][todayStr]) {
+        const record = tarbiyahData[userId][todayStr];
+        let completedCount = 0;
+        let notCompletedCount = 0;
+
+        let reportMessage = `${user.displayName || user.firstName}\n=====================\n`;
+
+        TARBIYAH_POINTS.forEach((point, index) => {
+          const value = record[point.key] || false;
+          const status = value ? '✅' : '❌';
+          const pointNumber = index + 1;
+
+          reportMessage += `${pointNumber}. ${point.reportLabel} : ${status}\n`;
+
+          if (value) {
+            completedCount++;
+          } else {
+            notCompletedCount++;
+          }
+        });
+
+        const qisosAmount = notCompletedCount * 5000;
+        const bonusAmount = completedCount * 1000;
+        const formatRupiah = (amount) => amount.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ".");
+
+        reportMessage += `================\n`;
+        reportMessage += `Qisos perhari Rp ${formatRupiah(qisosAmount)}\n`;
+        reportMessage += `Bonus perhari Rp ${formatRupiah(bonusAmount)}\n\n`;
+
+        allReports += reportMessage;
+        reportCount++;
+      }
     }
 
-    let allReports = `📊 <b>LAPORAN HARIAN TARBIYAH</b>\n${formattedDate}\n\n`;
-
-    records.forEach(record => {
-      const user = record.user;
-      let completedCount = 0;
-      let notCompletedCount = 0;
-
-      let reportMessage = `${user.displayName || user.firstName}\n=====================\n`;
-
-      TARBIYAH_POINTS.forEach((point, index) => {
-        const value = record[point.key];
-        const status = value ? '✅' : '❌';
-        const pointNumber = index + 1;
-
-        reportMessage += `${pointNumber}. ${point.reportLabel} : ${status}\n`;
-
-        if (value) {
-          completedCount++;
-        } else {
-          notCompletedCount++;
-        }
+    if (reportCount > 0) {
+      await bot.sendMessage(GROUP_CHAT_ID, allReports, {
+        parse_mode: 'HTML',
+        message_thread_id: MESSAGE_THREAD_ID
       });
-
-      // Calculate qisos and bonus
-      const qisosAmount = notCompletedCount * 5000;
-      const bonusAmount = completedCount * 1000;
-
-      const formatRupiah = (amount) => {
-        return amount.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ".");
-      };
-
-      reportMessage += `================\n`;
-      reportMessage += `Qisos perhari Rp ${formatRupiah(qisosAmount)}\n`;
-      reportMessage += `Bonus perhari Rp ${formatRupiah(bonusAmount)}\n\n`;
-
-      allReports += reportMessage;
-    });
-
-    // Send to group
-    await bot.sendMessage(GROUP_CHAT_ID, allReports, {
-      parse_mode: 'HTML',
-      message_thread_id: MESSAGE_THREAD_ID
-    });
-
-    console.log(`Daily report sent for ${records.length} users - ${todayStr}`);
+      console.log(`Daily report sent for ${reportCount} users - ${todayStr}`);
+    }
   } catch (error) {
     console.error('Error sending daily report:', error);
   }
 }
 
-// Schedule daily report for 23:00 WIB
+// Admin command
+bot.onText(/\/dailyreport/, async (msg) => {
+  if (msg.from.id !== ADMIN_USER_ID) return;
+  
+  await sendDailyReport();
+  bot.sendMessage(msg.chat.id, '📊 Daily report berhasil dikirim ke grup.');
+});
+
+// Schedule daily report
 cron.schedule('0 23 * * *', () => {
   console.log('Sending scheduled daily report...');
   sendDailyReport();
-}, {
-  timezone: "Asia/Jakarta"
-});
+}, { timezone: "Asia/Jakarta" });
 
 // Webhook endpoint
 app.post('/webhook', (req, res) => {
@@ -396,21 +413,20 @@ app.post('/webhook', (req, res) => {
   res.sendStatus(200);
 });
 
-// Health check endpoint
+// Health check
 app.get('/health', (req, res) => {
   res.json({ status: 'OK', timestamp: new Date().toISOString() });
 });
 
-// Start server
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`🚀 Tarbiyah Bot running on port ${PORT}`);
-  console.log(`🎯 Webhook URL: https://your-app-name.onrender.com/webhook`);
-});
+// Initialize and start
+async function start() {
+  await ensureDataDir();
+  const PORT = process.env.PORT || 3000;
+  
+  app.listen(PORT, () => {
+    console.log(`🚀 Tarbiyah Bot running on port ${PORT}`);
+    console.log(`💾 Using JSON file storage (100% FREE!)`);
+  });
+}
 
-// Graceful shutdown
-process.on('SIGINT', async () => {
-  console.log('Shutting down gracefully...');
-  await prisma.$disconnect();
-  process.exit(0);
-});
+start();
