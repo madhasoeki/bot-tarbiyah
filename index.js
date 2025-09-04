@@ -138,6 +138,18 @@ async function initDatabase() {
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       )
     `);
+    // Create user daily modes table (for tracking daily mode)
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS user_daily_modes (
+        telegram_id BIGINT,
+        record_date DATE,
+        mode VARCHAR(20) DEFAULT 'normal',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (telegram_id, record_date)
+      )
+    `);
+    console.log('✅ User daily modes table ready');
     console.log('✅ Udzhur states table ready');
 
     console.log('✅ Database tables initialized successfully');
@@ -206,20 +218,19 @@ async function updateUserTeamHandler(telegramId, isTeamHandler) {
 async function getTodayTarbiyah(telegramId) {
   try {
     const today = moment().tz('Asia/Jakarta').format('YYYY-MM-DD');
+    
+    // Get user's mode for today
+    const userMode = await getUserDailyMode(telegramId);
+    
+    // Get tarbiyah records
     const result = await pool.query(
-      'SELECT point_key, status, udzhur_reason, mode FROM tarbiyah_records WHERE telegram_id = $1 AND record_date = $2',
+      'SELECT point_key, status, udzhur_reason FROM tarbiyah_records WHERE telegram_id = $1 AND record_date = $2',
       [telegramId, today]
     );
 
     const todayRecord = {};
-    let userMode = 'normal'; // Default mode
     
     result.rows.forEach(row => {
-      // Detect user's mode from any record today
-      if (row.mode === 'haid') {
-        userMode = 'haid';
-      }
-      
       if (row.status === 'udzhur') {
         todayRecord[row.point_key] = {
           status: 'udzhur',
@@ -231,10 +242,10 @@ async function getTodayTarbiyah(telegramId) {
     });
 
     const hasData = Object.keys(todayRecord).length > 0;
-    return hasData ? { record: todayRecord, mode: userMode } : null;
+    return hasData ? { record: todayRecord, mode: userMode } : { record: null, mode: userMode };
   } catch (error) {
     console.error('Error getting today tarbiyah:', error);
-    return null;
+    return { record: null, mode: 'normal' };
   }
 }
 
@@ -262,6 +273,58 @@ async function updateTarbiyahPoint(telegramId, pointKey, value, udzhurReason = n
     return true;
   } catch (error) {
     console.error('Error updating tarbiyah point:', error);
+    return false;
+  }
+}
+
+// User daily mode management
+async function setUserDailyMode(telegramId, mode) {
+  try {
+    const today = moment().tz('Asia/Jakarta').format('YYYY-MM-DD');
+    await pool.query(
+      `INSERT INTO user_daily_modes (telegram_id, record_date, mode, updated_at)
+       VALUES ($1, $2, $3, CURRENT_TIMESTAMP)
+       ON CONFLICT (telegram_id, record_date)
+       DO UPDATE SET mode = EXCLUDED.mode, updated_at = CURRENT_TIMESTAMP`,
+      [telegramId, today, mode]
+    );
+    return true;
+  } catch (error) {
+    console.error('Error setting user daily mode:', error);
+    return false;
+  }
+}
+
+async function getUserDailyMode(telegramId) {
+  try {
+    const today = moment().tz('Asia/Jakarta').format('YYYY-MM-DD');
+    const result = await pool.query(
+      'SELECT mode FROM user_daily_modes WHERE telegram_id = $1 AND record_date = $2',
+      [telegramId, today]
+    );
+    return result.rows.length > 0 ? result.rows[0].mode : 'normal';
+  } catch (error) {
+    console.error('Error getting user daily mode:', error);
+    return 'normal';
+  }
+}
+
+async function clearUserDailyData(telegramId, newMode) {
+  try {
+    const today = moment().tz('Asia/Jakarta').format('YYYY-MM-DD');
+    
+    // Delete all tarbiyah records for today (since we're switching modes)
+    await pool.query(
+      'DELETE FROM tarbiyah_records WHERE telegram_id = $1 AND record_date = $2',
+      [telegramId, today]
+    );
+    
+    // Set new mode
+    await setUserDailyMode(telegramId, newMode);
+    
+    return true;
+  } catch (error) {
+    console.error('Error clearing user daily data:', error);
     return false;
   }
 }
@@ -435,16 +498,54 @@ bot.onText(/\/catat($|\s+(.+))/, async (msg, match) => {
 
   // Check if this is haid mode
   const parameter = match[2] ? match[2].trim().toLowerCase() : '';
-  const isHaidMode = parameter === 'haid';
+  const requestedMode = parameter === 'haid' ? 'haid' : 'normal';
+  
+  // Get current user mode for today
+  const currentMode = await getUserDailyMode(msg.from.id);
+  
+  // Check if user is switching modes
+  if (currentMode !== requestedMode) {
+    // Get existing data to check if there are conflicts
+    const todayData = await getTodayTarbiyah(msg.from.id);
+    const hasExistingData = todayData && todayData.record && Object.keys(todayData.record).length > 0;
+    
+    if (hasExistingData) {
+      // User has existing data but wants to switch mode - ask for confirmation
+      const currentModeText = currentMode === 'haid' ? 'Mode Haid' : 'Mode Normal';
+      const newModeText = requestedMode === 'haid' ? 'Mode Haid' : 'Mode Normal';
+      
+      const confirmMessage = `⚠️ <b>Konfirmasi Ganti Mode</b>\n\n` +
+                           `Mode saat ini: <b>${currentModeText}</b>\n` +
+                           `Mode yang diminta: <b>${newModeText}</b>\n\n` +
+                           `❗ Anda sudah memiliki data tarbiyah hari ini dengan ${currentModeText}.\n\n` +
+                           `Jika Anda melanjutkan ke ${newModeText}, semua data tarbiyah hari ini akan dihapus dan dimulai dari awal.\n\n` +
+                           `Apakah Anda yakin ingin mengganti mode?`;
+      
+      const keyboard = {
+        inline_keyboard: [[
+          { text: '✅ Ya, Ganti Mode', callback_data: `change_mode_${requestedMode}_confirm` },
+          { text: '❌ Batal', callback_data: 'change_mode_cancel' }
+        ]]
+      };
+
+      return bot.sendMessage(msg.chat.id, confirmMessage, { 
+        parse_mode: 'HTML',
+        reply_markup: keyboard 
+      });
+    } else {
+      // No existing data, just set the new mode
+      await setUserDailyMode(msg.from.id, requestedMode);
+    }
+  }
   
   const today = moment().tz('Asia/Jakarta').format('DD/MM/YYYY');
-  const todayRecord = await getTodayTarbiyah(msg.from.id);
+  const todayData = await getTodayTarbiyah(msg.from.id);
   
-  // Get appropriate tarbiyah points (use false as default if isTeamHandler is null/undefined)
-  const tarbiyahPoints = getTarbiyahPoints(user.is_team_handler || false, isHaidMode);
+  // Get appropriate tarbiyah points
+  const tarbiyahPoints = getTarbiyahPoints(user.is_team_handler || false, requestedMode === 'haid');
 
   // Send header
-  const modeText = isHaidMode ? ' (Mode Haid)' : '';
+  const modeText = requestedMode === 'haid' ? ' (Mode Haid)' : '';
   const teamText = user.is_team_handler ? ' - Handle Tim' : '';
   const headerMessage = `📋 <b>Catat Tarbiyah${modeText} - ${today}</b>\n👤 <b>Nama:</b> ${user.display_name}${teamText}\n\nSilakan klik untuk setiap aktivitas tarbiyah:`;
   bot.sendMessage(msg.chat.id, headerMessage, { parse_mode: 'HTML' });
@@ -452,13 +553,13 @@ bot.onText(/\/catat($|\s+(.+))/, async (msg, match) => {
   // Send each tarbiyah point as separate message
   for (let i = 0; i < tarbiyahPoints.length; i++) {
     const point = tarbiyahPoints[i];
-    const statusInfo = getTarbiyahStatus(todayRecord, point.key);
+    const statusInfo = getTarbiyahStatus(todayData?.record, point.key);
 
     const keyboard = {
       inline_keyboard: [[
-        { text: '✅ Sudah', callback_data: `tarbiyah_${point.key}_done_${isHaidMode ? 'haid' : 'normal'}` },
-        { text: '❌ Belum', callback_data: `tarbiyah_${point.key}_undone_${isHaidMode ? 'haid' : 'normal'}` },
-        { text: '🔄 Udzhur', callback_data: `tarbiyah_${point.key}_udzhur_${isHaidMode ? 'haid' : 'normal'}` }
+        { text: '✅ Sudah', callback_data: `tarbiyah_${point.key}_done_${requestedMode}` },
+        { text: '❌ Belum', callback_data: `tarbiyah_${point.key}_undone_${requestedMode}` },
+        { text: '🔄 Udzhur', callback_data: `tarbiyah_${point.key}_udzhur_${requestedMode}` }
       ]]
     };
 
@@ -613,6 +714,37 @@ bot.on('message', async (msg) => {
 bot.on('callback_query', async (query) => {
   const data = query.data;
 
+  // Handle mode change confirmation
+  if (data.startsWith('change_mode_')) {
+    if (data === 'change_mode_cancel') {
+      bot.editMessageText('❌ <b>Penggantian mode dibatalkan</b>\n\nData tarbiyah Anda tetap aman.', {
+        chat_id: query.message.chat.id,
+        message_id: query.message.message_id,
+        parse_mode: 'HTML'
+      });
+      bot.answerCallbackQuery(query.id, { text: 'Dibatalkan' });
+      return;
+    }
+    
+    if (data.includes('_confirm')) {
+      const newMode = data.includes('haid') ? 'haid' : 'normal';
+      const success = await clearUserDailyData(query.from.id, newMode);
+      
+      if (success) {
+        const modeText = newMode === 'haid' ? 'Mode Haid' : 'Mode Normal';
+        bot.editMessageText(`✅ <b>Mode berhasil diubah ke ${modeText}</b>\n\nData tarbiyah hari ini telah dihapus dan siap dimulai dari awal.\n\n💡 Gunakan /catat${newMode === 'haid' ? ' haid' : ''} untuk mulai mencatat.`, {
+          chat_id: query.message.chat.id,
+          message_id: query.message.message_id,
+          parse_mode: 'HTML'
+        });
+        bot.answerCallbackQuery(query.id, { text: `Mode diubah ke ${modeText}` });
+      } else {
+        bot.answerCallbackQuery(query.id, { text: 'Error mengubah mode' });
+      }
+      return;
+    }
+  }
+
   // Handle team setup
   if (data === 'setup_team_yes' || data === 'setup_team_no') {
     const isTeamHandler = data === 'setup_team_yes';
@@ -704,12 +836,14 @@ async function sendDailyReport() {
     const todayStr = today.format('YYYY-MM-DD');
     const formattedDate = today.format('dddd, D MMMM YYYY');
     
-    // Get all users with their today's records
+    // Get all users with their today's records and modes
     const result = await pool.query(`
       SELECT u.telegram_id, u.display_name, u.is_team_handler,
-             tr.point_key, tr.status, tr.udzhur_reason, tr.mode
+             tr.point_key, tr.status, tr.udzhur_reason,
+             udm.mode
       FROM users u
       LEFT JOIN tarbiyah_records tr ON u.telegram_id = tr.telegram_id AND tr.record_date = $1
+      LEFT JOIN user_daily_modes udm ON u.telegram_id = udm.telegram_id AND udm.record_date = $1
       WHERE u.display_name IS NOT NULL
       ORDER BY u.display_name, tr.point_key
     `, [todayStr]);
@@ -723,16 +857,11 @@ async function sendDailyReport() {
           display_name: row.display_name,
           is_team_handler: row.is_team_handler,
           records: {},
-          mode: 'normal' // Default mode
+          mode: row.mode || 'normal' // Use mode from user_daily_modes table
         };
       }
       
       if (row.point_key) {
-        // Set user mode if it's haid
-        if (row.mode === 'haid') {
-          usersData[row.telegram_id].mode = 'haid';
-        }
-        
         if (row.status === 'udzhur') {
           usersData[row.telegram_id].records[row.point_key] = {
             status: 'udzhur',
