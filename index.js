@@ -328,6 +328,16 @@ function getTarbiyahStatus(record, pointKey) {
 bot.onText(/\/start/, async (msg) => {
   if (msg.chat.type !== 'private') return;
 
+  // Check if database is available
+  if (!process.env.DATABASE_URL) {
+    return bot.sendMessage(msg.chat.id, 
+      '⚠️ <b>Bot sedang dalam mode maintenance</b>\n\n' +
+      'Database sedang dikonfigurasi. Bot akan kembali normal dalam beberapa menit.\n\n' +
+      'Silakan coba lagi nanti. Terima kasih!',
+      { parse_mode: 'HTML' }
+    );
+  }
+
   const user = await findOrCreateUser(msg.from);
   if (!user) {
     return bot.sendMessage(msg.chat.id, '❌ Terjadi error. Silakan coba lagi.');
@@ -382,6 +392,15 @@ bot.onText(/\/start/, async (msg) => {
 
 bot.onText(/\/catat($|\s+(.+))/, async (msg, match) => {
   if (msg.chat.type !== 'private') return;
+
+  // Check if database is available
+  if (!process.env.DATABASE_URL) {
+    return bot.sendMessage(msg.chat.id, 
+      '⚠️ <b>Bot sedang dalam mode maintenance</b>\n\n' +
+      'Database sedang dikonfigurasi. Silakan coba lagi nanti.',
+      { parse_mode: 'HTML' }
+    );
+  }
 
   const user = await findOrCreateUser(msg.from);
   if (!user || !user.display_name) {
@@ -863,18 +882,40 @@ async function start() {
     console.log('Environment:', process.env.NODE_ENV || 'development');
     console.log('Database URL configured:', process.env.DATABASE_URL ? 'Yes' : 'No');
     
-    await initDatabase();
+    // Only initialize database if DATABASE_URL is configured
+    if (process.env.DATABASE_URL) {
+      await initDatabase();
+      console.log('🐘 Using PostgreSQL Database (Persistent & Reliable!)');
+    } else {
+      console.log('⚠️  WARNING: DATABASE_URL not configured');
+      console.log('📄 Bot will run without database (temporary mode)');
+      console.log('🔧 Please set DATABASE_URL environment variable in Render Dashboard');
+    }
     
     const PORT = process.env.PORT || 3000;
     
     app.listen(PORT, () => {
       console.log(`🚀 Tarbiyah Bot running on port ${PORT}`);
-      console.log(`🐘 Using PostgreSQL Database (Persistent & Reliable!)`);
-      console.log(`📱 Bot ready to receive messages`);
+      console.log(`� Bot ready to receive messages`);
+      
+      if (!process.env.DATABASE_URL) {
+        console.log(`\n⚠️  IMPORTANT: Set these environment variables in Render:`);
+        console.log(`DATABASE_URL=postgresql://madhasoeki_user:QfwcwjEUmh1s76LCSPJ4DWgnvLWtkd8t@dpg-d2skhcmmcj7s73a9adr0-a.oregon-postgres.render.com/madhasoeki`);
+        console.log(`BOT_TOKEN=8382967299:AAGXrPv87BXrIchMpqmdVDHRtdZnHpSBz4w`);
+        console.log(`ADMIN_USER_ID=5077067370`);
+        console.log(`GROUP_CHAT_ID=-1002295813671`);
+        console.log(`MESSAGE_THREAD_ID=1971`);
+        console.log(`NODE_ENV=production\n`);
+      }
     });
   } catch (error) {
     console.error('❌ Failed to start bot:', error);
-    process.exit(1);
+    console.log('🔄 Trying to start without database...');
+    
+    const PORT = process.env.PORT || 3000;
+    app.listen(PORT, () => {
+      console.log(`🚀 Tarbiyah Bot running on port ${PORT} (Database disabled)`);
+    });
   }
 }
 
