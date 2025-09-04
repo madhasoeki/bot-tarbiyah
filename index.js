@@ -454,11 +454,20 @@ bot.onText(/\/catat($|\s+(.+))/, async (msg, match) => {
 bot.onText(/\/status/, async (msg) => {
   if (msg.chat.type !== 'private') return;
 
+  // Check if database is available
+  if (!process.env.DATABASE_URL) {
+    return bot.sendMessage(msg.chat.id, 
+      '⚠️ <b>Bot sedang dalam mode maintenance</b>\n\n' +
+      'Database sedang dikonfigurasi. Silakan coba lagi nanti.',
+      { parse_mode: 'HTML' }
+    );
+  }
+
   const user = await findOrCreateUser(msg.from);
   if (!user || !user.display_name) {
     let message = 'Silakan lengkapi registrasi Anda terlebih dahulu:\n\n';
     
-    if (!user.display_name) {
+    if (!user || !user.display_name) {
       message += '1. Set nama dengan: <b>Nama: [nama anda]</b>\n';
     }
 
