@@ -12,7 +12,19 @@ const bot = new TelegramBot(process.env.BOT_TOKEN);
 // Database connection
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
+  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
+  max: 3, // Maximum number of clients in the pool
+  idleTimeoutMillis: 30000, // Close idle clients after 30 seconds
+  connectionTimeoutMillis: 5000, // Return an error after 5 seconds if connection could not be established
+});
+
+// Test database connection
+pool.on('connect', () => {
+  console.log('✅ Connected to PostgreSQL database');
+});
+
+pool.on('error', (err) => {
+  console.error('❌ PostgreSQL connection error:', err);
 });
 
 // Middleware
@@ -65,9 +77,16 @@ const TARBIYAH_POINTS_HAID = [
 
 // Database initialization
 async function initDatabase() {
+  let client;
   try {
+    console.log('🔄 Initializing database...');
+    
+    // Test connection first
+    client = await pool.connect();
+    console.log('✅ Database connection successful');
+    
     // Create users table
-    await pool.query(`
+    await client.query(`
       CREATE TABLE IF NOT EXISTS users (
         telegram_id BIGINT PRIMARY KEY,
         first_name VARCHAR(255),
@@ -79,9 +98,10 @@ async function initDatabase() {
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       )
     `);
+    console.log('✅ Users table ready');
 
     // Create tarbiyah records table
-    await pool.query(`
+    await client.query(`
       CREATE TABLE IF NOT EXISTS tarbiyah_records (
         id SERIAL PRIMARY KEY,
         telegram_id BIGINT REFERENCES users(telegram_id),
@@ -94,9 +114,10 @@ async function initDatabase() {
         UNIQUE(telegram_id, record_date, point_key)
       )
     `);
+    console.log('✅ Tarbiyah records table ready');
 
     // Create udzhur state table
-    await pool.query(`
+    await client.query(`
       CREATE TABLE IF NOT EXISTS udzhur_states (
         telegram_id BIGINT PRIMARY KEY,
         point_key VARCHAR(100),
@@ -105,10 +126,17 @@ async function initDatabase() {
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       )
     `);
+    console.log('✅ Udzhur states table ready');
 
     console.log('✅ Database tables initialized successfully');
   } catch (error) {
     console.error('❌ Error initializing database:', error);
+    console.error('Database URL:', process.env.DATABASE_URL ? 'Set' : 'Not set');
+    throw error;
+  } finally {
+    if (client) {
+      client.release();
+    }
   }
 }
 
@@ -766,6 +794,31 @@ bot.onText(/\/settim/, async (msg) => {
   });
 });
 
+// Admin debug command
+bot.onText(/\/debug/, async (msg) => {
+  if (msg.from.id !== ADMIN_USER_ID) return;
+  
+  try {
+    const client = await pool.connect();
+    const result = await client.query('SELECT NOW() as current_time');
+    client.release();
+    
+    const debugInfo = `🔧 <b>Debug Info</b>\n\n` +
+                     `✅ Database: Connected\n` +
+                     `🕐 Server Time: ${result.rows[0].current_time}\n` +
+                     `🤖 Bot: Running\n` +
+                     `🌐 Environment: ${process.env.NODE_ENV || 'development'}`;
+    
+    bot.sendMessage(msg.chat.id, debugInfo, { parse_mode: 'HTML' });
+  } catch (error) {
+    const errorInfo = `❌ <b>Debug Error</b>\n\n` +
+                     `Database: ${error.message}\n` +
+                     `Environment: ${process.env.NODE_ENV || 'development'}`;
+    
+    bot.sendMessage(msg.chat.id, errorInfo, { parse_mode: 'HTML' });
+  }
+});
+
 // Schedule daily report
 cron.schedule('0 23 * * *', () => {
   console.log('Sending scheduled daily report...');
@@ -779,23 +832,50 @@ app.post('/webhook', (req, res) => {
 });
 
 // Health check
-app.get('/health', (req, res) => {
-  res.json({ 
-    status: 'OK', 
-    timestamp: new Date().toISOString(),
-    database: 'PostgreSQL Connected'
-  });
+app.get('/health', async (req, res) => {
+  try {
+    const client = await pool.connect();
+    const result = await client.query('SELECT NOW() as db_time');
+    client.release();
+    
+    res.json({ 
+      status: 'OK', 
+      timestamp: new Date().toISOString(),
+      database: 'PostgreSQL Connected',
+      db_time: result.rows[0].db_time,
+      environment: process.env.NODE_ENV || 'development'
+    });
+  } catch (error) {
+    res.status(500).json({ 
+      status: 'ERROR', 
+      timestamp: new Date().toISOString(),
+      database: 'PostgreSQL Error',
+      error: error.message,
+      environment: process.env.NODE_ENV || 'development'
+    });
+  }
 });
 
 // Initialize and start
 async function start() {
-  await initDatabase();
-  const PORT = process.env.PORT || 3000;
-  
-  app.listen(PORT, () => {
-    console.log(`🚀 Tarbiyah Bot running on port ${PORT}`);
-    console.log(`🐘 Using PostgreSQL Database (Persistent & Reliable!)`);
-  });
+  try {
+    console.log('🚀 Starting Tarbiyah Bot...');
+    console.log('Environment:', process.env.NODE_ENV || 'development');
+    console.log('Database URL configured:', process.env.DATABASE_URL ? 'Yes' : 'No');
+    
+    await initDatabase();
+    
+    const PORT = process.env.PORT || 3000;
+    
+    app.listen(PORT, () => {
+      console.log(`🚀 Tarbiyah Bot running on port ${PORT}`);
+      console.log(`🐘 Using PostgreSQL Database (Persistent & Reliable!)`);
+      console.log(`📱 Bot ready to receive messages`);
+    });
+  } catch (error) {
+    console.error('❌ Failed to start bot:', error);
+    process.exit(1);
+  }
 }
 
 start();
