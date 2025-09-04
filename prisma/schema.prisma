@@ -1,0 +1,66 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id            Int      @id @default(autoincrement())
+  telegramId    BigInt   @unique @map("telegram_id")
+  firstName     String?  @map("first_name")
+  lastName      String?  @map("last_name")
+  username      String?
+  displayName   String?  @map("display_name")
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  tarbiyahRecords TarbiyahRecord[]
+
+  @@map("users")
+}
+
+model TarbiyahRecord {
+  id                  Int      @id @default(autoincrement())
+  userId              Int      @map("user_id")
+  date                DateTime @db.Date
+  
+  // Aktivitas Tarbiyah (21 poin)
+  tahajud             Boolean  @default(false)
+  qobliyahSubuh       Boolean  @default(false) @map("qobliyah_subuh")
+  subuh               Boolean  @default(false)
+  dhuha               Boolean  @default(false)
+  qobliyahDzuhur      Boolean  @default(false) @map("qobliyah_dzuhur")
+  dzuhur              Boolean  @default(false)
+  badiahDzuhur        Boolean  @default(false) @map("badiah_dzuhur")
+  qobliyahAshar       Boolean  @default(false) @map("qobliyah_ashar")
+  ashar               Boolean  @default(false)
+  maghrib             Boolean  @default(false)
+  badiahMaghrib       Boolean  @default(false) @map("badiah_maghrib")
+  qobliyahIsya        Boolean  @default(false) @map("qobliyah_isya")
+  isya                Boolean  @default(false)
+  badiahIsya          Boolean  @default(false) @map("badiah_isya")
+  odoj                Boolean  @default(false)
+  nafs                Boolean  @default(false)
+  bacaArtiQuran       Boolean  @default(false) @map("baca_arti_quran")
+  infaqSubuh          Boolean  @default(false) @map("infaq_subuh")
+  istighfar           Boolean  @default(false)
+  sholawat            Boolean  @default(false)
+  buzzer              Boolean  @default(false)
+  
+  createdAt           DateTime @default(now()) @map("created_at")
+  updatedAt           DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  user                User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Unique constraint
+  @@unique([userId, date])
+  @@map("tarbiyah_records")
+}

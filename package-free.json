@@ -1,0 +1,23 @@
+{
+  "name": "tarbiyah-bot-free",
+  "version": "1.0.0",
+  "description": "Bot Telegram untuk tracking aktivitas tarbiyah harian - 100% GRATIS dengan JSON storage",
+  "main": "index-json.js",
+  "scripts": {
+    "start": "node index-json.js",
+    "dev": "nodemon index-json.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "node-telegram-bot-api": "^0.64.0",
+    "dotenv": "^16.3.1",
+    "node-cron": "^3.0.2",
+    "moment-timezone": "^0.5.43"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.1"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
