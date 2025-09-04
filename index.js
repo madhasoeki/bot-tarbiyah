@@ -882,6 +882,15 @@ async function start() {
     console.log('Environment:', process.env.NODE_ENV || 'development');
     console.log('Database URL configured:', process.env.DATABASE_URL ? 'Yes' : 'No');
     
+    // Debug: Print partial DATABASE_URL for verification (mask password)
+    if (process.env.DATABASE_URL) {
+      const dbUrl = process.env.DATABASE_URL;
+      const maskedUrl = dbUrl.replace(/:([^:@]*@)/g, ':***@');
+      console.log('Database URL (masked):', maskedUrl);
+    } else {
+      console.log('❌ DATABASE_URL environment variable is not set!');
+    }
+    
     // Only initialize database if DATABASE_URL is configured
     if (process.env.DATABASE_URL) {
       await initDatabase();
