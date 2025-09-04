@@ -1,7 +1,7 @@
 {
   "name": "tarbiyah-bot",
   "version": "1.0.0",
-  "description": "Bot Telegram untuk tracking aktivitas tarbiyah harian - 100% GRATIS dengan JSON storage",
+  "description": "Bot Telegram untuk tracking aktivitas tarbiyah harian dengan PostgreSQL database",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
@@ -12,7 +12,8 @@
     "node-telegram-bot-api": "^0.64.0",
     "dotenv": "^16.3.1",
     "node-cron": "^3.0.2",
-    "moment-timezone": "^0.5.43"
+    "moment-timezone": "^0.5.43",
+    "pg": "^8.11.3"
   },
   "devDependencies": {
     "nodemon": "^3.0.1"

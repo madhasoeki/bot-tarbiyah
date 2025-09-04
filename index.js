@@ -1,7 +1,6 @@
 const express = require('express');
 const TelegramBot = require('node-telegram-bot-api');
-const fs = require('fs').promises;
-const path = require('path');
+const { Pool } = require('pg');
 const cron = require('node-cron');
 const moment = require('moment-timezone');
 require('dotenv').config();
@@ -10,11 +9,11 @@ require('dotenv').config();
 const app = express();
 const bot = new TelegramBot(process.env.BOT_TOKEN);
 
-// Data file paths
-const DATA_DIR = './data';
-const USERS_FILE = path.join(DATA_DIR, 'users.json');
-const TARBIYAH_FILE = path.join(DATA_DIR, 'tarbiyah.json');
-const UDZHUR_STATE_FILE = path.join(DATA_DIR, 'udzhur_state.json');
+// Database connection
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
+});
 
 // Middleware
 app.use(express.json());
@@ -64,58 +63,74 @@ const TARBIYAH_POINTS_HAID = [
   { key: 'buzzer', label: 'Buzzer', reportLabel: 'Buzzer' }
 ];
 
-// File system helpers
-async function ensureDataDir() {
+// Database initialization
+async function initDatabase() {
   try {
-    await fs.mkdir(DATA_DIR, { recursive: true });
+    // Create users table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS users (
+        telegram_id BIGINT PRIMARY KEY,
+        first_name VARCHAR(255),
+        last_name VARCHAR(255),
+        username VARCHAR(255),
+        display_name VARCHAR(255),
+        is_team_handler BOOLEAN DEFAULT FALSE,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    // Create tarbiyah records table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS tarbiyah_records (
+        id SERIAL PRIMARY KEY,
+        telegram_id BIGINT REFERENCES users(telegram_id),
+        record_date DATE,
+        point_key VARCHAR(100),
+        status VARCHAR(20), -- 'done', 'undone', 'udzhur'
+        udzhur_reason TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(telegram_id, record_date, point_key)
+      )
+    `);
+
+    // Create udzhur state table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS udzhur_states (
+        telegram_id BIGINT PRIMARY KEY,
+        point_key VARCHAR(100),
+        mode VARCHAR(20),
+        point_label VARCHAR(255),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    console.log('✅ Database tables initialized successfully');
   } catch (error) {
-    console.error('Error creating data directory:', error);
+    console.error('❌ Error initializing database:', error);
   }
 }
 
-async function readJsonFile(filePath, defaultValue = {}) {
-  try {
-    const data = await fs.readFile(filePath, 'utf8');
-    return JSON.parse(data);
-  } catch (error) {
-    if (error.code === 'ENOENT') {
-      // File doesn't exist, return default value
-      await writeJsonFile(filePath, defaultValue);
-      return defaultValue;
-    }
-    console.error(`Error reading ${filePath}:`, error);
-    return defaultValue;
-  }
-}
-
-async function writeJsonFile(filePath, data) {
-  try {
-    await fs.writeFile(filePath, JSON.stringify(data, null, 2), 'utf8');
-  } catch (error) {
-    console.error(`Error writing ${filePath}:`, error);
-  }
-}
-
-// Data access functions
+// Database helper functions
 async function findOrCreateUser(telegramUser) {
   try {
-    const users = await readJsonFile(USERS_FILE, {});
-    const userId = telegramUser.id.toString();
+    const userResult = await pool.query(
+      'SELECT * FROM users WHERE telegram_id = $1',
+      [telegramUser.id]
+    );
 
-    if (!users[userId]) {
-      users[userId] = {
-        telegramId: telegramUser.id,
-        firstName: telegramUser.first_name,
-        lastName: telegramUser.last_name,
-        username: telegramUser.username,
-        displayName: null,
-        isTeamHandler: null, // null = belum diset, true = handle tim, false = tidak handle tim
-        createdAt: new Date().toISOString()
-      };
-      await writeJsonFile(USERS_FILE, users);
+    if (userResult.rows.length === 0) {
+      const insertResult = await pool.query(
+        `INSERT INTO users (telegram_id, first_name, last_name, username, display_name, is_team_handler) 
+         VALUES ($1, $2, $3, $4, NULL, FALSE) 
+         RETURNING *`,
+        [telegramUser.id, telegramUser.first_name, telegramUser.last_name, telegramUser.username]
+      );
+      return insertResult.rows[0];
     }
 
-    return users[userId];
+    return userResult.rows[0];
   } catch (error) {
     console.error('Error in findOrCreateUser:', error);
     return null;
@@ -124,15 +139,11 @@ async function findOrCreateUser(telegramUser) {
 
 async function updateUserName(telegramId, displayName) {
   try {
-    const users = await readJsonFile(USERS_FILE, {});
-    const userId = telegramId.toString();
-    
-    if (users[userId]) {
-      users[userId].displayName = displayName;
-      await writeJsonFile(USERS_FILE, users);
-      return true;
-    }
-    return false;
+    const result = await pool.query(
+      'UPDATE users SET display_name = $1, updated_at = CURRENT_TIMESTAMP WHERE telegram_id = $2',
+      [displayName, telegramId]
+    );
+    return result.rowCount > 0;
   } catch (error) {
     console.error('Error updating user name:', error);
     return false;
@@ -141,17 +152,108 @@ async function updateUserName(telegramId, displayName) {
 
 async function updateUserTeamHandler(telegramId, isTeamHandler) {
   try {
-    const users = await readJsonFile(USERS_FILE, {});
-    const userId = telegramId.toString();
-    
-    if (users[userId]) {
-      users[userId].isTeamHandler = isTeamHandler;
-      await writeJsonFile(USERS_FILE, users);
-      return true;
-    }
-    return false;
+    const result = await pool.query(
+      'UPDATE users SET is_team_handler = $1, updated_at = CURRENT_TIMESTAMP WHERE telegram_id = $2',
+      [isTeamHandler, telegramId]
+    );
+    return result.rowCount > 0;
   } catch (error) {
     console.error('Error updating user team handler status:', error);
+    return false;
+  }
+}
+
+async function getTodayTarbiyah(telegramId) {
+  try {
+    const today = moment().tz('Asia/Jakarta').format('YYYY-MM-DD');
+    const result = await pool.query(
+      'SELECT point_key, status, udzhur_reason FROM tarbiyah_records WHERE telegram_id = $1 AND record_date = $2',
+      [telegramId, today]
+    );
+
+    const todayRecord = {};
+    result.rows.forEach(row => {
+      if (row.status === 'udzhur') {
+        todayRecord[row.point_key] = {
+          status: 'udzhur',
+          reason: row.udzhur_reason
+        };
+      } else {
+        todayRecord[row.point_key] = row.status === 'done';
+      }
+    });
+
+    return Object.keys(todayRecord).length > 0 ? todayRecord : null;
+  } catch (error) {
+    console.error('Error getting today tarbiyah:', error);
+    return null;
+  }
+}
+
+async function updateTarbiyahPoint(telegramId, pointKey, value, udzhurReason = null) {
+  try {
+    const today = moment().tz('Asia/Jakarta').format('YYYY-MM-DD');
+    
+    let status, reason;
+    if (udzhurReason) {
+      status = 'udzhur';
+      reason = udzhurReason;
+    } else {
+      status = value ? 'done' : 'undone';
+      reason = null;
+    }
+
+    await pool.query(
+      `INSERT INTO tarbiyah_records (telegram_id, record_date, point_key, status, udzhur_reason, updated_at)
+       VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP)
+       ON CONFLICT (telegram_id, record_date, point_key)
+       DO UPDATE SET status = EXCLUDED.status, udzhur_reason = EXCLUDED.udzhur_reason, updated_at = CURRENT_TIMESTAMP`,
+      [telegramId, today, pointKey, status, reason]
+    );
+
+    return true;
+  } catch (error) {
+    console.error('Error updating tarbiyah point:', error);
+    return false;
+  }
+}
+
+// Udzhur state management
+async function setUdzhurState(telegramId, pointKey, mode, pointLabel) {
+  try {
+    await pool.query(
+      `INSERT INTO udzhur_states (telegram_id, point_key, mode, point_label)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (telegram_id)
+       DO UPDATE SET point_key = EXCLUDED.point_key, mode = EXCLUDED.mode, point_label = EXCLUDED.point_label, created_at = CURRENT_TIMESTAMP`,
+      [telegramId, pointKey, mode, pointLabel]
+    );
+    return true;
+  } catch (error) {
+    console.error('Error setting udzhur state:', error);
+    return false;
+  }
+}
+
+async function getUdzhurState(telegramId) {
+  try {
+    const result = await pool.query(
+      'SELECT * FROM udzhur_states WHERE telegram_id = $1',
+      [telegramId]
+    );
+    return result.rows.length > 0 ? result.rows[0] : null;
+  } catch (error) {
+    console.error('Error getting udzhur state:', error);
+    return null;
+  }
+}
+
+async function clearUdzhurState(telegramId) {
+  try {
+    await pool.query('DELETE FROM udzhur_states WHERE telegram_id = $1', [telegramId]);
+    return true;
+  } catch (error) {
+    console.error('Error clearing udzhur state:', error);
     return false;
   }
 }
@@ -194,104 +296,6 @@ function getTarbiyahStatus(record, pointKey) {
   }
 }
 
-// Udzhur state management
-async function setUdzhurState(telegramId, pointKey, mode, pointLabel) {
-  try {
-    const udzhurState = await readJsonFile(UDZHUR_STATE_FILE, {});
-    const userId = telegramId.toString();
-    
-    udzhurState[userId] = {
-      pointKey,
-      mode,
-      pointLabel,
-      timestamp: new Date().toISOString()
-    };
-    
-    await writeJsonFile(UDZHUR_STATE_FILE, udzhurState);
-    return true;
-  } catch (error) {
-    console.error('Error setting udzhur state:', error);
-    return false;
-  }
-}
-
-async function getUdzhurState(telegramId) {
-  try {
-    const udzhurState = await readJsonFile(UDZHUR_STATE_FILE, {});
-    const userId = telegramId.toString();
-    return udzhurState[userId] || null;
-  } catch (error) {
-    console.error('Error getting udzhur state:', error);
-    return null;
-  }
-}
-
-async function clearUdzhurState(telegramId) {
-  try {
-    const udzhurState = await readJsonFile(UDZHUR_STATE_FILE, {});
-    const userId = telegramId.toString();
-    
-    if (udzhurState[userId]) {
-      delete udzhurState[userId];
-      await writeJsonFile(UDZHUR_STATE_FILE, udzhurState);
-    }
-    
-    return true;
-  } catch (error) {
-    console.error('Error clearing udzhur state:', error);
-    return false;
-  }
-}
-
-async function getTodayTarbiyah(telegramId) {
-  try {
-    const today = moment().tz('Asia/Jakarta').format('YYYY-MM-DD');
-    const tarbiyahData = await readJsonFile(TARBIYAH_FILE, {});
-    const userId = telegramId.toString();
-    
-    return tarbiyahData[userId] && tarbiyahData[userId][today] 
-      ? tarbiyahData[userId][today] 
-      : null;
-  } catch (error) {
-    console.error('Error getting today tarbiyah:', error);
-    return null;
-  }
-}
-
-async function updateTarbiyahPoint(telegramId, pointKey, value, udzhurReason = null) {
-  try {
-    const today = moment().tz('Asia/Jakarta').format('YYYY-MM-DD');
-    const tarbiyahData = await readJsonFile(TARBIYAH_FILE, {});
-    const userId = telegramId.toString();
-    
-    if (!tarbiyahData[userId]) {
-      tarbiyahData[userId] = {};
-    }
-    
-    if (!tarbiyahData[userId][today]) {
-      tarbiyahData[userId][today] = {};
-    }
-    
-    // Store the value and udzhur reason if provided
-    if (udzhurReason) {
-      tarbiyahData[userId][today][pointKey] = {
-        status: 'udzhur',
-        reason: udzhurReason
-      };
-    } else {
-      tarbiyahData[userId][today][pointKey] = value;
-    }
-    
-    tarbiyahData[userId][today].updatedAt = new Date().toISOString();
-    
-    await writeJsonFile(TARBIYAH_FILE, tarbiyahData);
-    return true;
-  } catch (error) {
-    console.error('Error updating tarbiyah point:', error);
-    return false;
-  }
-}
-
 // Bot Command Handlers
 bot.onText(/\/start/, async (msg) => {
   if (msg.chat.type !== 'private') return;
@@ -303,21 +307,22 @@ bot.onText(/\/start/, async (msg) => {
 
   let responseText;
   
-  if (user.displayName && user.isTeamHandler !== null) {
+  if (user.display_name && user.is_team_handler !== null) {
     // User sudah terdaftar lengkap
-    const teamStatus = user.isTeamHandler ? 'Handle Tim' : 'Tidak Handle Tim';
-    responseText = `Assalamu'alaikum ${user.displayName}! 👋\n\n` +
+    const teamStatus = user.is_team_handler ? 'Handle Tim' : 'Tidak Handle Tim';
+    responseText = `Assalamu'alaikum ${user.display_name}! 👋\n\n` +
                   `🤖 <b>Bot Tarbiyah</b>\n` +
                   `👤 <b>Status:</b> ${teamStatus}\n\n` +
                   `Bot ini membantu Anda mencatat aktivitas tarbiyah harian.\n\n` +
                   `📋 <b>Command tersedia:</b>\n` +
                   `• /catat - Catat tarbiyah hari ini\n` +
                   `• /catat haid - Catat tarbiyah mode haid (untuk perempuan)\n` +
-                  `• /status - Lihat status tarbiyah hari ini\n\n` +
+                  `• /status - Lihat status tarbiyah hari ini\n` +
+                  `• /settim - Ubah status handle tim\n\n` +
                   `💡 <b>Tips:</b> Gunakan /catat setiap hari untuk mencatat aktivitas tarbiyah Anda!`;
-  } else if (user.displayName && user.isTeamHandler === null) {
+  } else if (user.display_name && user.is_team_handler === null) {
     // User sudah ada nama tapi belum konfirmasi handle tim
-    responseText = `Assalamu'alaikum ${user.displayName}! 👋\n\n` +
+    responseText = `Assalamu'alaikum ${user.display_name}! 👋\n\n` +
                   `🤖 <b>Bot Tarbiyah</b>\n\n` +
                   `📝 <b>Langkah terakhir:</b>\n` +
                   `Apakah Anda handle tim (koordinator)?`;
@@ -338,7 +343,7 @@ bot.onText(/\/start/, async (msg) => {
     responseText = `Assalamu'alaikum! 👋\n\n` +
                   `🤖 <b>Selamat datang di Bot Tarbiyah</b>\n` +
                   `Bot ini membantu Anda mencatat aktivitas tarbiyah harian.\n\n` +
-                  `� <b>Langkah pertama:</b>\n` +
+                  `📝 <b>Langkah pertama:</b>\n` +
                   `Silakan set nama Anda dengan format:\n` +
                   `<b>Nama: [nama anda]</b>\n\n` +
                   `Contoh: <b>Nama: Ahmad</b>`;
@@ -351,15 +356,11 @@ bot.onText(/\/catat($|\s+(.+))/, async (msg, match) => {
   if (msg.chat.type !== 'private') return;
 
   const user = await findOrCreateUser(msg.from);
-  if (!user || !user.displayName || user.isTeamHandler === null) {
+  if (!user || !user.display_name) {
     let message = 'Silakan lengkapi registrasi Anda terlebih dahulu:\n\n';
     
-    if (!user.displayName) {
+    if (!user.display_name) {
       message += '1. Set nama dengan: <b>Nama: [nama anda]</b>\n';
-    }
-    
-    if (user.isTeamHandler === null) {
-      message += '2. Konfirmasi status handle tim dengan /start\n';
     }
 
     return bot.sendMessage(msg.chat.id, message, { parse_mode: 'HTML' });
@@ -372,13 +373,13 @@ bot.onText(/\/catat($|\s+(.+))/, async (msg, match) => {
   const today = moment().tz('Asia/Jakarta').format('DD/MM/YYYY');
   const todayRecord = await getTodayTarbiyah(msg.from.id);
   
-  // Get appropriate tarbiyah points
-  const tarbiyahPoints = getTarbiyahPoints(user.isTeamHandler, isHaidMode);
+  // Get appropriate tarbiyah points (use false as default if isTeamHandler is null/undefined)
+  const tarbiyahPoints = getTarbiyahPoints(user.is_team_handler || false, isHaidMode);
 
   // Send header
   const modeText = isHaidMode ? ' (Mode Haid)' : '';
-  const teamText = user.isTeamHandler ? ' - Handle Tim' : '';
-  const headerMessage = `📋 <b>Catat Tarbiyah${modeText} - ${today}</b>\n👤 <b>Nama:</b> ${user.displayName}${teamText}\n\nSilakan klik untuk setiap aktivitas tarbiyah:`;
+  const teamText = user.is_team_handler ? ' - Handle Tim' : '';
+  const headerMessage = `📋 <b>Catat Tarbiyah${modeText} - ${today}</b>\n👤 <b>Nama:</b> ${user.display_name}${teamText}\n\nSilakan klik untuk setiap aktivitas tarbiyah:`;
   bot.sendMessage(msg.chat.id, headerMessage, { parse_mode: 'HTML' });
 
   // Send each tarbiyah point as separate message
@@ -407,15 +408,11 @@ bot.onText(/\/status/, async (msg) => {
   if (msg.chat.type !== 'private') return;
 
   const user = await findOrCreateUser(msg.from);
-  if (!user || !user.displayName || user.isTeamHandler === null) {
+  if (!user || !user.display_name) {
     let message = 'Silakan lengkapi registrasi Anda terlebih dahulu:\n\n';
     
-    if (!user.displayName) {
+    if (!user.display_name) {
       message += '1. Set nama dengan: <b>Nama: [nama anda]</b>\n';
-    }
-    
-    if (user.isTeamHandler === null) {
-      message += '2. Konfirmasi status handle tim dengan /start\n';
     }
 
     return bot.sendMessage(msg.chat.id, message, { parse_mode: 'HTML' });
@@ -424,14 +421,14 @@ bot.onText(/\/status/, async (msg) => {
   const today = moment().tz('Asia/Jakarta').format('DD/MM/YYYY');
   const todayRecord = await getTodayTarbiyah(msg.from.id);
   
-  const teamText = user.isTeamHandler ? ' - Handle Tim' : '';
-  let message = `📊 <b>Status Tarbiyah - ${today}</b>\n👤 <b>Nama:</b> ${user.displayName}${teamText}\n\n`;
+  const teamText = user.is_team_handler ? ' - Handle Tim' : '';
+  let message = `📊 <b>Status Tarbiyah - ${today}</b>\n👤 <b>Nama:</b> ${user.display_name}${teamText}\n\n`;
 
   if (todayRecord) {
     let completedCount = 0;
     
     // Get all possible points for this user (normal mode with team handler consideration)
-    const normalPoints = getTarbiyahPoints(user.isTeamHandler, false);
+    const normalPoints = getTarbiyahPoints(user.is_team_handler || false, false);
     
     normalPoints.forEach(point => {
       const statusInfo = getTarbiyahStatus(todayRecord, point.key);
@@ -514,13 +511,13 @@ bot.on('message', async (msg) => {
     }
     
     // Save udzhur with reason
-    const success = await updateTarbiyahPoint(msg.from.id, udzhurState.pointKey, null, reason);
+    const success = await updateTarbiyahPoint(msg.from.id, udzhurState.point_key, null, reason);
     
     if (success) {
       await clearUdzhurState(msg.from.id);
       
       const responseText = `✅ <b>Udzhur berhasil disimpan</b>\n\n` +
-                          `Poin: <b>${udzhurState.pointLabel}</b>\n` +
+                          `Poin: <b>${udzhurState.point_label}</b>\n` +
                           `Alasan: <b>${reason}</b>\n\n` +
                           `💡 <i>Gunakan /catat${udzhurState.mode === 'haid' ? ' haid' : ''} untuk melihat semua status atau mengedit.</i>`;
       
@@ -547,7 +544,8 @@ bot.on('callback_query', async (query) => {
                           `Sekarang Anda bisa menggunakan:\n` +
                           `• /catat - untuk mencatat tarbiyah normal\n` +
                           `• /catat haid - untuk mencatat tarbiyah mode haid\n` +
-                          `• /status - untuk melihat status tarbiyah`;
+                          `• /status - untuk melihat status tarbiyah\n` +
+                          `• /settim - untuk mengubah status handle tim`;
 
       bot.editMessageText(responseText, {
         chat_id: query.message.chat.id,
@@ -573,7 +571,7 @@ bot.on('callback_query', async (query) => {
       // Get user info to determine correct tarbiyah points
       const user = await findOrCreateUser(query.from);
       const isHaidMode = mode === 'haid';
-      const tarbiyahPoints = getTarbiyahPoints(user.isTeamHandler, isHaidMode);
+      const tarbiyahPoints = getTarbiyahPoints(user.is_team_handler, isHaidMode);
       const point = tarbiyahPoints.find(p => p.key === pointKey);
       
       if (point) {
@@ -625,30 +623,60 @@ async function sendDailyReport() {
     const todayStr = today.format('YYYY-MM-DD');
     const formattedDate = today.format('dddd, D MMMM YYYY');
     
-    const users = await readJsonFile(USERS_FILE, {});
-    const tarbiyahData = await readJsonFile(TARBIYAH_FILE, {});
+    // Get all users with their today's records
+    const result = await pool.query(`
+      SELECT u.telegram_id, u.display_name, u.is_team_handler,
+             tr.point_key, tr.status, tr.udzhur_reason
+      FROM users u
+      LEFT JOIN tarbiyah_records tr ON u.telegram_id = tr.telegram_id AND tr.record_date = $1
+      WHERE u.display_name IS NOT NULL
+      ORDER BY u.display_name, tr.point_key
+    `, [todayStr]);
+
+    const usersData = {};
     
+    // Group data by user
+    result.rows.forEach(row => {
+      if (!usersData[row.telegram_id]) {
+        usersData[row.telegram_id] = {
+          display_name: row.display_name,
+          is_team_handler: row.is_team_handler,
+          records: {}
+        };
+      }
+      
+      if (row.point_key) {
+        if (row.status === 'udzhur') {
+          usersData[row.telegram_id].records[row.point_key] = {
+            status: 'udzhur',
+            reason: row.udzhur_reason
+          };
+        } else {
+          usersData[row.telegram_id].records[row.point_key] = row.status === 'done';
+        }
+      }
+    });
+
     let allReports = `📊 <b>LAPORAN HARIAN TARBIYAH</b>\n${formattedDate}\n\n`;
     let reportCount = 0;
 
-    for (const [userId, user] of Object.entries(users)) {
-      if (tarbiyahData[userId] && tarbiyahData[userId][todayStr] && user.displayName) {
-        const record = tarbiyahData[userId][todayStr];
+    for (const [userId, userData] of Object.entries(usersData)) {
+      if (Object.keys(userData.records).length > 0) {
         let completedCount = 0;
         let notCompletedCount = 0;
 
         // Determine if this is haid mode based on recorded data
-        const isHaidMode = record.alMulk !== undefined || record.bacaBuku !== undefined || record.jurnalSyukur !== undefined;
+        const isHaidMode = userData.records.alMulk !== undefined || userData.records.bacaBuku !== undefined || userData.records.jurnalSyukur !== undefined;
         
         // Get appropriate tarbiyah points for this user
-        const tarbiyahPoints = getTarbiyahPoints(user.isTeamHandler || false, isHaidMode);
+        const tarbiyahPoints = getTarbiyahPoints(userData.is_team_handler || false, isHaidMode);
 
-        const teamText = user.isTeamHandler ? ' (Handle Tim)' : '';
+        const teamText = userData.is_team_handler ? ' (Handle Tim)' : '';
         const modeText = isHaidMode ? ' - Mode Haid' : '';
-        let reportMessage = `${user.displayName}${teamText}${modeText}\n=====================\n`;
+        let reportMessage = `${userData.display_name}${teamText}${modeText}\n=====================\n`;
 
         tarbiyahPoints.forEach((point, index) => {
-          const value = record[point.key];
+          const value = userData.records[point.key];
           let status, isCompleted;
           
           if (!value) {
@@ -708,6 +736,36 @@ bot.onText(/\/dailyreport/, async (msg) => {
   bot.sendMessage(msg.chat.id, '📊 Daily report berhasil dikirim ke grup.');
 });
 
+// Command to set team handler status
+bot.onText(/\/settim/, async (msg) => {
+  if (msg.chat.type !== 'private') return;
+
+  const user = await findOrCreateUser(msg.from);
+  if (!user || !user.display_name) {
+    return bot.sendMessage(msg.chat.id, 
+      'Silakan set nama Anda terlebih dahulu dengan mengetik: <b>Nama: [nama anda]</b>',
+      { parse_mode: 'HTML' }
+    );
+  }
+
+  const currentStatus = user.is_team_handler ? 'Handle Tim' : 'Tidak Handle Tim';
+  const responseText = `🔧 <b>Pengaturan Status Tim</b>\n\n` +
+                      `Status saat ini: <b>${currentStatus}</b>\n\n` +
+                      `Apakah Anda handle tim (koordinator)?`;
+
+  const keyboard = {
+    inline_keyboard: [[
+      { text: '✅ Ya, saya handle tim', callback_data: 'setup_team_yes' },
+      { text: '❌ Tidak handle tim', callback_data: 'setup_team_no' }
+    ]]
+  };
+
+  bot.sendMessage(msg.chat.id, responseText, { 
+    parse_mode: 'HTML',
+    reply_markup: keyboard 
+  });
+});
+
 // Schedule daily report
 cron.schedule('0 23 * * *', () => {
   console.log('Sending scheduled daily report...');
@@ -722,17 +780,21 @@ app.post('/webhook', (req, res) => {
 
 // Health check
 app.get('/health', (req, res) => {
-  res.json({ status: 'OK', timestamp: new Date().toISOString() });
+  res.json({ 
+    status: 'OK', 
+    timestamp: new Date().toISOString(),
+    database: 'PostgreSQL Connected'
+  });
 });
 
 // Initialize and start
 async function start() {
-  await ensureDataDir();
+  await initDatabase();
   const PORT = process.env.PORT || 3000;
   
   app.listen(PORT, () => {
     console.log(`🚀 Tarbiyah Bot running on port ${PORT}`);
-    console.log(`💾 Using JSON file storage (100% FREE!)`);
+    console.log(`🐘 Using PostgreSQL Database (Persistent & Reliable!)`);
   });
 }
 
