@@ -24,7 +24,7 @@ const GROUP_CHAT_ID = process.env.GROUP_CHAT_ID;
 const MESSAGE_THREAD_ID = process.env.MESSAGE_THREAD_ID;
 
 // Tarbiyah Points Configuration
-const TARBIYAH_POINTS = [
+const TARBIYAH_POINTS_NORMAL = [
   { key: 'tahajud', label: 'Tahajjud', reportLabel: 'Tahajjud' },
   { key: 'qobliyahSubuh', label: 'Qobliyah Subuh', reportLabel: 'Qobliyah Subuh' },
   { key: 'subuh', label: 'Sholat Subuh', reportLabel: 'Subuh Berjamaah Di Masjid Tepat Waktu' },
@@ -46,6 +46,21 @@ const TARBIYAH_POINTS = [
   { key: 'istighfar', label: 'Istighfar 100x', reportLabel: 'Istighfar 100x' },
   { key: 'sholawat', label: 'Sholawat 100x', reportLabel: 'Sholawat 100x' },
   { key: 'buzzer', label: 'Buzzer', reportLabel: 'Buzzer PD' }
+];
+
+// Tarbiyah Points untuk mode haid
+const TARBIYAH_POINTS_HAID = [
+  { key: 'nafs', label: 'NAFS', reportLabel: 'NAFS' },
+  { key: 'alMulk', label: 'Al-mulk', reportLabel: 'Al-mulk' },
+  { key: 'infaqSubuh', label: 'Infaq Subuh', reportLabel: 'Infaq Subuh' },
+  { key: 'istighfar', label: 'Istighfar 500x', reportLabel: 'Istighfar 500x' },
+  { key: 'sholawat', label: 'Sholawat 300x', reportLabel: 'Sholawat 300x' },
+  { key: 'bacaBuku', label: 'Baca Buku 5 Halaman', reportLabel: 'Baca Buku 5 Halaman' },
+  { key: 'bacaArtiQuran', label: 'Baca arti Qur\'an 5 Lembar', reportLabel: 'Baca arti Qur\'an 5 Lembar' },
+  { key: 'jurnalSyukur', label: 'Jurnal Syukur (5)', reportLabel: 'Jurnal Syukur (5)' },
+  { key: 'alMasurat', label: 'Al-ma\'surat pagi', reportLabel: 'Al-ma\'surat pagi' },
+  { key: 'alMasuratPetang', label: 'Al-ma\'surat petang', reportLabel: 'Al-ma\'surat petang' },
+  { key: 'buzzer', label: 'Buzzer', reportLabel: 'Buzzer' }
 ];
 
 // File system helpers
@@ -93,6 +108,7 @@ async function findOrCreateUser(telegramUser) {
         lastName: telegramUser.last_name,
         username: telegramUser.username,
         displayName: null,
+        isTeamHandler: null, // null = belum diset, true = handle tim, false = tidak handle tim
         createdAt: new Date().toISOString()
       };
       await writeJsonFile(USERS_FILE, users);
@@ -120,6 +136,39 @@ async function updateUserName(telegramId, displayName) {
     console.error('Error updating user name:', error);
     return false;
   }
+}
+
+async function updateUserTeamHandler(telegramId, isTeamHandler) {
+  try {
+    const users = await readJsonFile(USERS_FILE, {});
+    const userId = telegramId.toString();
+    
+    if (users[userId]) {
+      users[userId].isTeamHandler = isTeamHandler;
+      await writeJsonFile(USERS_FILE, users);
+      return true;
+    }
+    return false;
+  } catch (error) {
+    console.error('Error updating user team handler status:', error);
+    return false;
+  }
+}
+
+// Helper function to get tarbiyah points based on user type and mode
+function getTarbiyahPoints(isTeamHandler, isHaidMode = false) {
+  let points = isHaidMode ? [...TARBIYAH_POINTS_HAID] : [...TARBIYAH_POINTS_NORMAL];
+  
+  // Add Hisab Ibadah Tim point for team handlers
+  if (isTeamHandler && !isHaidMode) {
+    points.push({ key: 'hisabIbadahTim', label: 'Hisab Ibadah Tim', reportLabel: 'Hisab Ibadah Tim' });
+  } else if (isTeamHandler && isHaidMode) {
+    // Insert Hisab Ibadah Tim before Buzzer for haid mode
+    const buzzerIndex = points.findIndex(p => p.key === 'buzzer');
+    points.splice(buzzerIndex, 0, { key: 'hisabIbadahTim', label: 'Hisab Ibadah Tim', reportLabel: 'Hisab Ibadah Tim' });
+  }
+  
+  return points;
 }
 
 async function getTodayTarbiyah(telegramId) {
@@ -173,58 +222,94 @@ bot.onText(/\/start/, async (msg) => {
 
   let responseText;
   
-  if (user.displayName) {
+  if (user.displayName && user.isTeamHandler !== null) {
+    // User sudah terdaftar lengkap
+    const teamStatus = user.isTeamHandler ? 'Handle Tim' : 'Tidak Handle Tim';
     responseText = `Assalamu'alaikum ${user.displayName}! 👋\n\n` +
                   `🤖 <b>Bot Tarbiyah</b>\n` +
+                  `👤 <b>Status:</b> ${teamStatus}\n\n` +
                   `Bot ini membantu Anda mencatat aktivitas tarbiyah harian.\n\n` +
                   `📋 <b>Command tersedia:</b>\n` +
                   `• /catat - Catat tarbiyah hari ini\n` +
+                  `• /catat haid - Catat tarbiyah mode haid (untuk perempuan)\n` +
                   `• /status - Lihat status tarbiyah hari ini\n\n` +
                   `💡 <b>Tips:</b> Gunakan /catat setiap hari untuk mencatat aktivitas tarbiyah Anda!`;
+  } else if (user.displayName && user.isTeamHandler === null) {
+    // User sudah ada nama tapi belum konfirmasi handle tim
+    responseText = `Assalamu'alaikum ${user.displayName}! 👋\n\n` +
+                  `🤖 <b>Bot Tarbiyah</b>\n\n` +
+                  `📝 <b>Langkah terakhir:</b>\n` +
+                  `Apakah Anda handle tim (koordinator)?`;
+    
+    const keyboard = {
+      inline_keyboard: [[
+        { text: '✅ Ya, saya handle tim', callback_data: 'setup_team_yes' },
+        { text: '❌ Tidak handle tim', callback_data: 'setup_team_no' }
+      ]]
+    };
+
+    return bot.sendMessage(msg.chat.id, responseText, { 
+      parse_mode: 'HTML',
+      reply_markup: keyboard 
+    });
   } else {
+    // User baru, belum ada nama
     responseText = `Assalamu'alaikum! 👋\n\n` +
                   `🤖 <b>Selamat datang di Bot Tarbiyah</b>\n` +
                   `Bot ini membantu Anda mencatat aktivitas tarbiyah harian.\n\n` +
-                  `📝 <b>Langkah pertama:</b>\n` +
+                  `� <b>Langkah pertama:</b>\n` +
                   `Silakan set nama Anda dengan format:\n` +
                   `<b>Nama: [nama anda]</b>\n\n` +
-                  `Contoh: <b>Nama: Ahmad</b>\n\n` +
-                  `📋 <b>Command tersedia:</b>\n` +
-                  `• /catat - Catat tarbiyah hari ini\n` +
-                  `• /status - Lihat status tarbiyah hari ini`;
+                  `Contoh: <b>Nama: Ahmad</b>`;
   }
 
   bot.sendMessage(msg.chat.id, responseText, { parse_mode: 'HTML' });
 });
 
-bot.onText(/\/catat/, async (msg) => {
+bot.onText(/\/catat($|\s+(.+))/, async (msg, match) => {
   if (msg.chat.type !== 'private') return;
 
   const user = await findOrCreateUser(msg.from);
-  if (!user || !user.displayName) {
-    return bot.sendMessage(msg.chat.id, 
-      'Silakan set nama Anda terlebih dahulu dengan mengetik: <b>Nama: [nama anda]</b>\n\nContoh: <b>Nama: Ahmad</b>',
-      { parse_mode: 'HTML' }
-    );
+  if (!user || !user.displayName || user.isTeamHandler === null) {
+    let message = 'Silakan lengkapi registrasi Anda terlebih dahulu:\n\n';
+    
+    if (!user.displayName) {
+      message += '1. Set nama dengan: <b>Nama: [nama anda]</b>\n';
+    }
+    
+    if (user.isTeamHandler === null) {
+      message += '2. Konfirmasi status handle tim dengan /start\n';
+    }
+
+    return bot.sendMessage(msg.chat.id, message, { parse_mode: 'HTML' });
   }
 
+  // Check if this is haid mode
+  const parameter = match[2] ? match[2].trim().toLowerCase() : '';
+  const isHaidMode = parameter === 'haid';
+  
   const today = moment().tz('Asia/Jakarta').format('DD/MM/YYYY');
   const todayRecord = await getTodayTarbiyah(msg.from.id);
+  
+  // Get appropriate tarbiyah points
+  const tarbiyahPoints = getTarbiyahPoints(user.isTeamHandler, isHaidMode);
 
   // Send header
-  const headerMessage = `📋 <b>Catat Tarbiyah - ${today}</b>\n👤 <b>Nama:</b> ${user.displayName}\n\nSilakan klik untuk setiap aktivitas tarbiyah:`;
+  const modeText = isHaidMode ? ' (Mode Haid)' : '';
+  const teamText = user.isTeamHandler ? ' - Handle Tim' : '';
+  const headerMessage = `📋 <b>Catat Tarbiyah${modeText} - ${today}</b>\n👤 <b>Nama:</b> ${user.displayName}${teamText}\n\nSilakan klik untuk setiap aktivitas tarbiyah:`;
   bot.sendMessage(msg.chat.id, headerMessage, { parse_mode: 'HTML' });
 
   // Send each tarbiyah point as separate message
-  for (let i = 0; i < TARBIYAH_POINTS.length; i++) {
-    const point = TARBIYAH_POINTS[i];
+  for (let i = 0; i < tarbiyahPoints.length; i++) {
+    const point = tarbiyahPoints[i];
     const currentValue = todayRecord ? todayRecord[point.key] : false;
     const status = currentValue ? '✅ Sudah' : '⚪ Belum dipilih';
 
     const keyboard = {
       inline_keyboard: [[
-        { text: '✅ Sudah', callback_data: `tarbiyah_${point.key}_done` },
-        { text: '❌ Belum', callback_data: `tarbiyah_${point.key}_undone` }
+        { text: '✅ Sudah', callback_data: `tarbiyah_${point.key}_done_${isHaidMode ? 'haid' : 'normal'}` },
+        { text: '❌ Belum', callback_data: `tarbiyah_${point.key}_undone_${isHaidMode ? 'haid' : 'normal'}` }
       ]]
     };
 
@@ -241,29 +326,42 @@ bot.onText(/\/status/, async (msg) => {
   if (msg.chat.type !== 'private') return;
 
   const user = await findOrCreateUser(msg.from);
-  if (!user || !user.displayName) {
-    return bot.sendMessage(msg.chat.id, 
-      'Silakan set nama Anda terlebih dahulu dengan mengetik: <b>Nama: [nama anda]</b>',
-      { parse_mode: 'HTML' }
-    );
+  if (!user || !user.displayName || user.isTeamHandler === null) {
+    let message = 'Silakan lengkapi registrasi Anda terlebih dahulu:\n\n';
+    
+    if (!user.displayName) {
+      message += '1. Set nama dengan: <b>Nama: [nama anda]</b>\n';
+    }
+    
+    if (user.isTeamHandler === null) {
+      message += '2. Konfirmasi status handle tim dengan /start\n';
+    }
+
+    return bot.sendMessage(msg.chat.id, message, { parse_mode: 'HTML' });
   }
 
   const today = moment().tz('Asia/Jakarta').format('DD/MM/YYYY');
   const todayRecord = await getTodayTarbiyah(msg.from.id);
-
-  let message = `📊 <b>Status Tarbiyah - ${today}</b>\n👤 <b>Nama:</b> ${user.displayName}\n\n`;
+  
+  const teamText = user.isTeamHandler ? ' - Handle Tim' : '';
+  let message = `📊 <b>Status Tarbiyah - ${today}</b>\n👤 <b>Nama:</b> ${user.displayName}${teamText}\n\n`;
 
   if (todayRecord) {
     let completedCount = 0;
     
-    TARBIYAH_POINTS.forEach(point => {
+    // Get all possible points for this user (normal mode with team handler consideration)
+    const normalPoints = getTarbiyahPoints(user.isTeamHandler, false);
+    
+    normalPoints.forEach(point => {
       const status = todayRecord[point.key] ? '✅' : '❌';
       message += `${status} ${point.label}\n`;
       if (todayRecord[point.key]) completedCount++;
     });
 
-    const percentage = Math.round((completedCount / TARBIYAH_POINTS.length) * 100);
-    message += `\n📈 <b>Progress:</b> ${completedCount}/${TARBIYAH_POINTS.length} (${percentage}%)`;
+    const percentage = Math.round((completedCount / normalPoints.length) * 100);
+    message += `\n📈 <b>Progress:</b> ${completedCount}/${normalPoints.length} (${percentage}%)`;
+    
+    message += `\n\n💡 <b>Tips:</b>\n• Gunakan /catat untuk mode normal\n• Gunakan /catat haid untuk mode haid`;
   } else {
     message += 'Belum ada data tarbiyah untuk hari ini.\nGunakan /catat untuk mulai mencatat.';
   }
@@ -287,11 +385,20 @@ bot.onText(/^nama:\s*(.+)$/i, async (msg, match) => {
   
   if (success) {
     const responseText = `✅ Nama berhasil disimpan: <b>${name}</b>\n\n` +
-                        `Sekarang Anda bisa menggunakan:\n` +
-                        `• /catat - untuk mencatat tarbiyah\n` +
-                        `• /status - untuk melihat status tarbiyah`;
+                        `📝 <b>Langkah selanjutnya:</b>\n` +
+                        `Apakah Anda handle tim (koordinator)?`;
 
-    bot.sendMessage(msg.chat.id, responseText, { parse_mode: 'HTML' });
+    const keyboard = {
+      inline_keyboard: [[
+        { text: '✅ Ya, saya handle tim', callback_data: 'setup_team_yes' },
+        { text: '❌ Tidak handle tim', callback_data: 'setup_team_no' }
+      ]]
+    };
+
+    bot.sendMessage(msg.chat.id, responseText, { 
+      parse_mode: 'HTML',
+      reply_markup: keyboard 
+    });
   } else {
     bot.sendMessage(msg.chat.id, '❌ Gagal menyimpan nama. Silakan coba lagi.');
   }
@@ -301,22 +408,56 @@ bot.onText(/^nama:\s*(.+)$/i, async (msg, match) => {
 bot.on('callback_query', async (query) => {
   const data = query.data;
 
+  // Handle team setup
+  if (data === 'setup_team_yes' || data === 'setup_team_no') {
+    const isTeamHandler = data === 'setup_team_yes';
+    const success = await updateUserTeamHandler(query.from.id, isTeamHandler);
+    
+    if (success) {
+      const statusText = isTeamHandler ? 'Handle Tim' : 'Tidak Handle Tim';
+      const responseText = `✅ Status berhasil disimpan: <b>${statusText}</b>\n\n` +
+                          `🎉 <b>Registrasi selesai!</b>\n\n` +
+                          `Sekarang Anda bisa menggunakan:\n` +
+                          `• /catat - untuk mencatat tarbiyah normal\n` +
+                          `• /catat haid - untuk mencatat tarbiyah mode haid\n` +
+                          `• /status - untuk melihat status tarbiyah`;
+
+      bot.editMessageText(responseText, {
+        chat_id: query.message.chat.id,
+        message_id: query.message.message_id,
+        parse_mode: 'HTML'
+      });
+      
+      bot.answerCallbackQuery(query.id, { text: 'Registrasi selesai!' });
+    } else {
+      bot.answerCallbackQuery(query.id, { text: 'Error menyimpan data' });
+    }
+    return;
+  }
+
+  // Handle tarbiyah updates
   if (data.startsWith('tarbiyah_')) {
     const parts = data.split('_');
-    if (parts.length >= 3) {
-      const action = parts[parts.length - 1];
-      const pointKey = parts.slice(1, -1).join('_');
+    if (parts.length >= 4) {
+      const action = parts[parts.length - 2]; // done or undone
+      const mode = parts[parts.length - 1]; // normal or haid
+      const pointKey = parts.slice(1, -2).join('_');
       
       const value = action === 'done';
-      const point = TARBIYAH_POINTS.find(p => p.key === pointKey);
+      
+      // Get user info to determine correct tarbiyah points
+      const user = await findOrCreateUser(query.from);
+      const isHaidMode = mode === 'haid';
+      const tarbiyahPoints = getTarbiyahPoints(user.isTeamHandler, isHaidMode);
+      const point = tarbiyahPoints.find(p => p.key === pointKey);
       
       if (point) {
         const success = await updateTarbiyahPoint(query.from.id, pointKey, value);
         
         if (success) {
-          const index = TARBIYAH_POINTS.findIndex(p => p.key === pointKey);
+          const index = tarbiyahPoints.findIndex(p => p.key === pointKey);
           const status = value ? '✅ Sudah' : '❌ Belum';
-          const message = `${index + 1}. <b>${point.label}</b>\nStatus: ${status}\n\n✅ <i>Tersimpan! Gunakan /catat untuk mengedit.</i>`;
+          const message = `${index + 1}. <b>${point.label}</b>\nStatus: ${status}\n\n✅ <i>Tersimpan! Gunakan /catat${isHaidMode ? ' haid' : ''} untuk mengedit.</i>`;
           
           bot.editMessageText(message, {
             chat_id: query.message.chat.id,
@@ -347,14 +488,22 @@ async function sendDailyReport() {
     let reportCount = 0;
 
     for (const [userId, user] of Object.entries(users)) {
-      if (tarbiyahData[userId] && tarbiyahData[userId][todayStr]) {
+      if (tarbiyahData[userId] && tarbiyahData[userId][todayStr] && user.displayName) {
         const record = tarbiyahData[userId][todayStr];
         let completedCount = 0;
         let notCompletedCount = 0;
 
-        let reportMessage = `${user.displayName || user.firstName}\n=====================\n`;
+        // Determine if this is haid mode based on recorded data
+        const isHaidMode = record.alMulk !== undefined || record.bacaBuku !== undefined || record.jurnalSyukur !== undefined;
+        
+        // Get appropriate tarbiyah points for this user
+        const tarbiyahPoints = getTarbiyahPoints(user.isTeamHandler || false, isHaidMode);
 
-        TARBIYAH_POINTS.forEach((point, index) => {
+        const teamText = user.isTeamHandler ? ' (Handle Tim)' : '';
+        const modeText = isHaidMode ? ' - Mode Haid' : '';
+        let reportMessage = `${user.displayName}${teamText}${modeText}\n=====================\n`;
+
+        tarbiyahPoints.forEach((point, index) => {
           const value = record[point.key] || false;
           const status = value ? '✅' : '❌';
           const pointNumber = index + 1;
