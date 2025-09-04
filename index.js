@@ -14,6 +14,7 @@ const bot = new TelegramBot(process.env.BOT_TOKEN);
 const DATA_DIR = './data';
 const USERS_FILE = path.join(DATA_DIR, 'users.json');
 const TARBIYAH_FILE = path.join(DATA_DIR, 'tarbiyah.json');
+const UDZHUR_STATE_FILE = path.join(DATA_DIR, 'udzhur_state.json');
 
 // Middleware
 app.use(express.json());
@@ -171,6 +172,77 @@ function getTarbiyahPoints(isTeamHandler, isHaidMode = false) {
   return points;
 }
 
+// Helper function to get tarbiyah status display
+function getTarbiyahStatus(record, pointKey) {
+  if (!record || !record[pointKey]) {
+    return { text: '⚪ Belum dipilih', emoji: '❌', isCompleted: false };
+  }
+  
+  const value = record[pointKey];
+  
+  if (typeof value === 'object' && value.status === 'udzhur') {
+    return { 
+      text: `🔄 Udzhur (${value.reason})`, 
+      emoji: '🔄', 
+      isCompleted: true, // Udzhur counts as completed
+      reason: value.reason 
+    };
+  } else if (value === true) {
+    return { text: '✅ Sudah', emoji: '✅', isCompleted: true };
+  } else {
+    return { text: '❌ Belum', emoji: '❌', isCompleted: false };
+  }
+}
+
+// Udzhur state management
+async function setUdzhurState(telegramId, pointKey, mode, pointLabel) {
+  try {
+    const udzhurState = await readJsonFile(UDZHUR_STATE_FILE, {});
+    const userId = telegramId.toString();
+    
+    udzhurState[userId] = {
+      pointKey,
+      mode,
+      pointLabel,
+      timestamp: new Date().toISOString()
+    };
+    
+    await writeJsonFile(UDZHUR_STATE_FILE, udzhurState);
+    return true;
+  } catch (error) {
+    console.error('Error setting udzhur state:', error);
+    return false;
+  }
+}
+
+async function getUdzhurState(telegramId) {
+  try {
+    const udzhurState = await readJsonFile(UDZHUR_STATE_FILE, {});
+    const userId = telegramId.toString();
+    return udzhurState[userId] || null;
+  } catch (error) {
+    console.error('Error getting udzhur state:', error);
+    return null;
+  }
+}
+
+async function clearUdzhurState(telegramId) {
+  try {
+    const udzhurState = await readJsonFile(UDZHUR_STATE_FILE, {});
+    const userId = telegramId.toString();
+    
+    if (udzhurState[userId]) {
+      delete udzhurState[userId];
+      await writeJsonFile(UDZHUR_STATE_FILE, udzhurState);
+    }
+    
+    return true;
+  } catch (error) {
+    console.error('Error clearing udzhur state:', error);
+    return false;
+  }
+}
+
 async function getTodayTarbiyah(telegramId) {
   try {
     const today = moment().tz('Asia/Jakarta').format('YYYY-MM-DD');
@@ -186,7 +258,7 @@ async function getTodayTarbiyah(telegramId) {
   }
 }
 
-async function updateTarbiyahPoint(telegramId, pointKey, value) {
+async function updateTarbiyahPoint(telegramId, pointKey, value, udzhurReason = null) {
   try {
     const today = moment().tz('Asia/Jakarta').format('YYYY-MM-DD');
     const tarbiyahData = await readJsonFile(TARBIYAH_FILE, {});
@@ -200,7 +272,16 @@ async function updateTarbiyahPoint(telegramId, pointKey, value) {
       tarbiyahData[userId][today] = {};
     }
     
-    tarbiyahData[userId][today][pointKey] = value;
+    // Store the value and udzhur reason if provided
+    if (udzhurReason) {
+      tarbiyahData[userId][today][pointKey] = {
+        status: 'udzhur',
+        reason: udzhurReason
+      };
+    } else {
+      tarbiyahData[userId][today][pointKey] = value;
+    }
+    
     tarbiyahData[userId][today].updatedAt = new Date().toISOString();
     
     await writeJsonFile(TARBIYAH_FILE, tarbiyahData);
@@ -303,17 +384,17 @@ bot.onText(/\/catat($|\s+(.+))/, async (msg, match) => {
   // Send each tarbiyah point as separate message
   for (let i = 0; i < tarbiyahPoints.length; i++) {
     const point = tarbiyahPoints[i];
-    const currentValue = todayRecord ? todayRecord[point.key] : false;
-    const status = currentValue ? '✅ Sudah' : '⚪ Belum dipilih';
+    const statusInfo = getTarbiyahStatus(todayRecord, point.key);
 
     const keyboard = {
       inline_keyboard: [[
         { text: '✅ Sudah', callback_data: `tarbiyah_${point.key}_done_${isHaidMode ? 'haid' : 'normal'}` },
-        { text: '❌ Belum', callback_data: `tarbiyah_${point.key}_undone_${isHaidMode ? 'haid' : 'normal'}` }
+        { text: '❌ Belum', callback_data: `tarbiyah_${point.key}_undone_${isHaidMode ? 'haid' : 'normal'}` },
+        { text: '🔄 Udzhur', callback_data: `tarbiyah_${point.key}_udzhur_${isHaidMode ? 'haid' : 'normal'}` }
       ]]
     };
 
-    const message = `${i + 1}. <b>${point.label}</b>\nStatus: ${status}`;
+    const message = `${i + 1}. <b>${point.label}</b>\nStatus: ${statusInfo.text}`;
     
     await bot.sendMessage(msg.chat.id, message, {
       parse_mode: 'HTML',
@@ -353,9 +434,15 @@ bot.onText(/\/status/, async (msg) => {
     const normalPoints = getTarbiyahPoints(user.isTeamHandler, false);
     
     normalPoints.forEach(point => {
-      const status = todayRecord[point.key] ? '✅' : '❌';
-      message += `${status} ${point.label}\n`;
-      if (todayRecord[point.key]) completedCount++;
+      const statusInfo = getTarbiyahStatus(todayRecord, point.key);
+      message += `${statusInfo.emoji} ${point.label}`;
+      
+      if (statusInfo.reason) {
+        message += ` (${statusInfo.reason})`;
+      }
+      message += '\n';
+      
+      if (statusInfo.isCompleted) completedCount++;
     });
 
     const percentage = Math.round((completedCount / normalPoints.length) * 100);
@@ -404,6 +491,46 @@ bot.onText(/^nama:\s*(.+)$/i, async (msg, match) => {
   }
 });
 
+// Handle udzhur reason input
+bot.on('message', async (msg) => {
+  if (msg.chat.type !== 'private') return;
+  if (msg.text && (msg.text.startsWith('/') || msg.text.toLowerCase().startsWith('nama:'))) return;
+  
+  // Check if user is in udzhur input state
+  const udzhurState = await getUdzhurState(msg.from.id);
+  if (udzhurState && msg.text) {
+    const reason = msg.text.trim();
+    
+    if (reason.length < 3) {
+      return bot.sendMessage(msg.chat.id, 
+        '❌ Alasan udzhur terlalu singkat. Silakan berikan alasan yang lebih detail (minimal 3 karakter).'
+      );
+    }
+    
+    if (reason.length > 100) {
+      return bot.sendMessage(msg.chat.id, 
+        '❌ Alasan udzhur terlalu panjang. Maksimal 100 karakter.'
+      );
+    }
+    
+    // Save udzhur with reason
+    const success = await updateTarbiyahPoint(msg.from.id, udzhurState.pointKey, null, reason);
+    
+    if (success) {
+      await clearUdzhurState(msg.from.id);
+      
+      const responseText = `✅ <b>Udzhur berhasil disimpan</b>\n\n` +
+                          `Poin: <b>${udzhurState.pointLabel}</b>\n` +
+                          `Alasan: <b>${reason}</b>\n\n` +
+                          `💡 <i>Gunakan /catat${udzhurState.mode === 'haid' ? ' haid' : ''} untuk melihat semua status atau mengedit.</i>`;
+      
+      bot.sendMessage(msg.chat.id, responseText, { parse_mode: 'HTML' });
+    } else {
+      bot.sendMessage(msg.chat.id, '❌ Gagal menyimpan udzhur. Silakan coba lagi.');
+    }
+  }
+});
+
 // Handle callback queries
 bot.on('callback_query', async (query) => {
   const data = query.data;
@@ -439,11 +566,9 @@ bot.on('callback_query', async (query) => {
   if (data.startsWith('tarbiyah_')) {
     const parts = data.split('_');
     if (parts.length >= 4) {
-      const action = parts[parts.length - 2]; // done or undone
+      const action = parts[parts.length - 2]; // done, undone, or udzhur
       const mode = parts[parts.length - 1]; // normal or haid
       const pointKey = parts.slice(1, -2).join('_');
-      
-      const value = action === 'done';
       
       // Get user info to determine correct tarbiyah points
       const user = await findOrCreateUser(query.from);
@@ -452,12 +577,13 @@ bot.on('callback_query', async (query) => {
       const point = tarbiyahPoints.find(p => p.key === pointKey);
       
       if (point) {
-        const success = await updateTarbiyahPoint(query.from.id, pointKey, value);
-        
-        if (success) {
-          const index = tarbiyahPoints.findIndex(p => p.key === pointKey);
-          const status = value ? '✅ Sudah' : '❌ Belum';
-          const message = `${index + 1}. <b>${point.label}</b>\nStatus: ${status}\n\n✅ <i>Tersimpan! Gunakan /catat${isHaidMode ? ' haid' : ''} untuk mengedit.</i>`;
+        if (action === 'udzhur') {
+          // Set udzhur state and ask for reason
+          await setUdzhurState(query.from.id, pointKey, mode, point.label);
+          
+          const message = `🔄 <b>Input Alasan Udzhur</b>\n\n` +
+                         `Poin: <b>${point.label}</b>\n\n` +
+                         `Silakan ketik alasan udzhur Anda:`;
           
           bot.editMessageText(message, {
             chat_id: query.message.chat.id,
@@ -465,9 +591,27 @@ bot.on('callback_query', async (query) => {
             parse_mode: 'HTML'
           });
           
-          bot.answerCallbackQuery(query.id, { text: 'Tersimpan!' });
+          bot.answerCallbackQuery(query.id, { text: 'Silakan ketik alasan udzhur' });
         } else {
-          bot.answerCallbackQuery(query.id, { text: 'Error menyimpan data' });
+          // Handle done/undone normally
+          const value = action === 'done';
+          const success = await updateTarbiyahPoint(query.from.id, pointKey, value);
+          
+          if (success) {
+            const index = tarbiyahPoints.findIndex(p => p.key === pointKey);
+            const status = value ? '✅ Sudah' : '❌ Belum';
+            const message = `${index + 1}. <b>${point.label}</b>\nStatus: ${status}\n\n✅ <i>Tersimpan! Gunakan /catat${isHaidMode ? ' haid' : ''} untuk mengedit.</i>`;
+            
+            bot.editMessageText(message, {
+              chat_id: query.message.chat.id,
+              message_id: query.message.message_id,
+              parse_mode: 'HTML'
+            });
+            
+            bot.answerCallbackQuery(query.id, { text: 'Tersimpan!' });
+          } else {
+            bot.answerCallbackQuery(query.id, { text: 'Error menyimpan data' });
+          }
         }
       }
     }
@@ -504,13 +648,27 @@ async function sendDailyReport() {
         let reportMessage = `${user.displayName}${teamText}${modeText}\n=====================\n`;
 
         tarbiyahPoints.forEach((point, index) => {
-          const value = record[point.key] || false;
-          const status = value ? '✅' : '❌';
+          const value = record[point.key];
+          let status, isCompleted;
+          
+          if (!value) {
+            status = '❌';
+            isCompleted = false;
+          } else if (typeof value === 'object' && value.status === 'udzhur') {
+            status = `🔄 (${value.reason})`;
+            isCompleted = true; // Udzhur counts as completed
+          } else if (value === true) {
+            status = '✅';
+            isCompleted = true;
+          } else {
+            status = '❌';
+            isCompleted = false;
+          }
+          
           const pointNumber = index + 1;
-
           reportMessage += `${pointNumber}. ${point.reportLabel} : ${status}\n`;
 
-          if (value) {
+          if (isCompleted) {
             completedCount++;
           } else {
             notCompletedCount++;
