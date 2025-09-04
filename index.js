@@ -109,12 +109,24 @@ async function initDatabase() {
         point_key VARCHAR(100),
         status VARCHAR(20), -- 'done', 'undone', 'udzhur'
         udzhur_reason TEXT,
+        mode VARCHAR(20) DEFAULT 'normal', -- 'normal' or 'haid'
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         UNIQUE(telegram_id, record_date, point_key)
       )
     `);
     console.log('✅ Tarbiyah records table ready');
+
+    // Add mode column if it doesn't exist (for backward compatibility)
+    try {
+      await client.query(`
+        ALTER TABLE tarbiyah_records ADD COLUMN IF NOT EXISTS mode VARCHAR(20) DEFAULT 'normal'
+      `);
+      console.log('✅ Mode column added to tarbiyah_records table');
+    } catch (error) {
+      // Column might already exist, that's ok
+      console.log('⚠️ Mode column might already exist:', error.message);
+    }
 
     // Create udzhur state table
     await client.query(`
@@ -195,12 +207,19 @@ async function getTodayTarbiyah(telegramId) {
   try {
     const today = moment().tz('Asia/Jakarta').format('YYYY-MM-DD');
     const result = await pool.query(
-      'SELECT point_key, status, udzhur_reason FROM tarbiyah_records WHERE telegram_id = $1 AND record_date = $2',
+      'SELECT point_key, status, udzhur_reason, mode FROM tarbiyah_records WHERE telegram_id = $1 AND record_date = $2',
       [telegramId, today]
     );
 
     const todayRecord = {};
+    let userMode = 'normal'; // Default mode
+    
     result.rows.forEach(row => {
+      // Detect user's mode from any record today
+      if (row.mode === 'haid') {
+        userMode = 'haid';
+      }
+      
       if (row.status === 'udzhur') {
         todayRecord[row.point_key] = {
           status: 'udzhur',
@@ -211,14 +230,15 @@ async function getTodayTarbiyah(telegramId) {
       }
     });
 
-    return Object.keys(todayRecord).length > 0 ? todayRecord : null;
+    const hasData = Object.keys(todayRecord).length > 0;
+    return hasData ? { record: todayRecord, mode: userMode } : null;
   } catch (error) {
     console.error('Error getting today tarbiyah:', error);
     return null;
   }
 }
 
-async function updateTarbiyahPoint(telegramId, pointKey, value, udzhurReason = null) {
+async function updateTarbiyahPoint(telegramId, pointKey, value, udzhurReason = null, mode = 'normal') {
   try {
     const today = moment().tz('Asia/Jakarta').format('YYYY-MM-DD');
     
@@ -232,11 +252,11 @@ async function updateTarbiyahPoint(telegramId, pointKey, value, udzhurReason = n
     }
 
     await pool.query(
-      `INSERT INTO tarbiyah_records (telegram_id, record_date, point_key, status, udzhur_reason, updated_at)
-       VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP)
+      `INSERT INTO tarbiyah_records (telegram_id, record_date, point_key, status, udzhur_reason, mode, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, CURRENT_TIMESTAMP)
        ON CONFLICT (telegram_id, record_date, point_key)
-       DO UPDATE SET status = EXCLUDED.status, udzhur_reason = EXCLUDED.udzhur_reason, updated_at = CURRENT_TIMESTAMP`,
-      [telegramId, today, pointKey, status, reason]
+       DO UPDATE SET status = EXCLUDED.status, udzhur_reason = EXCLUDED.udzhur_reason, mode = EXCLUDED.mode, updated_at = CURRENT_TIMESTAMP`,
+      [telegramId, today, pointKey, status, reason, mode]
     );
 
     return true;
@@ -475,18 +495,23 @@ bot.onText(/\/status/, async (msg) => {
   }
 
   const today = moment().tz('Asia/Jakarta').format('DD/MM/YYYY');
-  const todayRecord = await getTodayTarbiyah(msg.from.id);
+  const todayData = await getTodayTarbiyah(msg.from.id);
   
   const teamText = user.is_team_handler ? ' - Handle Tim' : '';
   let message = `📊 <b>Status Tarbiyah - ${today}</b>\n👤 <b>Nama:</b> ${user.display_name}${teamText}\n\n`;
 
-  if (todayRecord) {
+  if (todayData) {
+    const { record: todayRecord, mode: userMode } = todayData;
     let completedCount = 0;
     
-    // Get all possible points for this user (normal mode with team handler consideration)
-    const normalPoints = getTarbiyahPoints(user.is_team_handler || false, false);
+    // Get points based on user's mode today (normal or haid)
+    const isHaidMode = userMode === 'haid';
+    const tarbiyahPoints = getTarbiyahPoints(user.is_team_handler || false, isHaidMode);
     
-    normalPoints.forEach(point => {
+    const modeText = isHaidMode ? ' (Mode Haid)' : '';
+    message = `📊 <b>Status Tarbiyah - ${today}${modeText}</b>\n👤 <b>Nama:</b> ${user.display_name}${teamText}\n\n`;
+    
+    tarbiyahPoints.forEach(point => {
       const statusInfo = getTarbiyahStatus(todayRecord, point.key);
       message += `${statusInfo.emoji} ${point.label}`;
       
@@ -498,8 +523,8 @@ bot.onText(/\/status/, async (msg) => {
       if (statusInfo.isCompleted) completedCount++;
     });
 
-    const percentage = Math.round((completedCount / normalPoints.length) * 100);
-    message += `\n📈 <b>Progress:</b> ${completedCount}/${normalPoints.length} (${percentage}%)`;
+    const percentage = Math.round((completedCount / tarbiyahPoints.length) * 100);
+    message += `\n📈 <b>Progress:</b> ${completedCount}/${tarbiyahPoints.length} (${percentage}%)`;
     
     message += `\n\n💡 <b>Tips:</b>\n• Gunakan /catat untuk mode normal\n• Gunakan /catat haid untuk mode haid`;
   } else {
@@ -567,7 +592,7 @@ bot.on('message', async (msg) => {
     }
     
     // Save udzhur with reason
-    const success = await updateTarbiyahPoint(msg.from.id, udzhurState.point_key, null, reason);
+    const success = await updateTarbiyahPoint(msg.from.id, udzhurState.point_key, null, reason, udzhurState.mode);
     
     if (success) {
       await clearUdzhurState(msg.from.id);
@@ -649,7 +674,7 @@ bot.on('callback_query', async (query) => {
         } else {
           // Handle done/undone normally
           const value = action === 'done';
-          const success = await updateTarbiyahPoint(query.from.id, pointKey, value);
+          const success = await updateTarbiyahPoint(query.from.id, pointKey, value, null, mode);
           
           if (success) {
             const index = tarbiyahPoints.findIndex(p => p.key === pointKey);
@@ -682,7 +707,7 @@ async function sendDailyReport() {
     // Get all users with their today's records
     const result = await pool.query(`
       SELECT u.telegram_id, u.display_name, u.is_team_handler,
-             tr.point_key, tr.status, tr.udzhur_reason
+             tr.point_key, tr.status, tr.udzhur_reason, tr.mode
       FROM users u
       LEFT JOIN tarbiyah_records tr ON u.telegram_id = tr.telegram_id AND tr.record_date = $1
       WHERE u.display_name IS NOT NULL
@@ -697,11 +722,17 @@ async function sendDailyReport() {
         usersData[row.telegram_id] = {
           display_name: row.display_name,
           is_team_handler: row.is_team_handler,
-          records: {}
+          records: {},
+          mode: 'normal' // Default mode
         };
       }
       
       if (row.point_key) {
+        // Set user mode if it's haid
+        if (row.mode === 'haid') {
+          usersData[row.telegram_id].mode = 'haid';
+        }
+        
         if (row.status === 'udzhur') {
           usersData[row.telegram_id].records[row.point_key] = {
             status: 'udzhur',
@@ -721,8 +752,8 @@ async function sendDailyReport() {
         let completedCount = 0;
         let notCompletedCount = 0;
 
-        // Determine if this is haid mode based on recorded data
-        const isHaidMode = userData.records.alMulk !== undefined || userData.records.bacaBuku !== undefined || userData.records.jurnalSyukur !== undefined;
+        // Determine mode from database records
+        const isHaidMode = userData.mode === 'haid';
         
         // Get appropriate tarbiyah points for this user
         const tarbiyahPoints = getTarbiyahPoints(userData.is_team_handler || false, isHaidMode);
